@@ -1,0 +1,7 @@
+gradio
+opencv-python
+numpy
+Pillow
+matplotlib
+tqdm
+git+https://github.com/facebookresearch/sam2.git
