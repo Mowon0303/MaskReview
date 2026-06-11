@@ -81,8 +81,8 @@ def build_demo(args: argparse.Namespace):
         vos_optimized=args.vos_optimized,
     )
 
-    with gr.Blocks(title="SAM2 Propagation Review Loop") as demo:
-        gr.Markdown("# SAM2 Propagation Review Loop")
+    with gr.Blocks(title="MaskReview") as demo:
+        gr.Markdown("# MaskReview")
         with gr.Row():
             video = gr.Video(label="Input video")
             output = gr.Video(label="SAM2 propagation overlay")

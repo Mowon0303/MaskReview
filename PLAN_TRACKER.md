@@ -1,6 +1,6 @@
 # Plan Tracker
 
-项目定位：SAM2 传播后的复核闭环。系统自动标注先跑完，只把低置信或疑似漂移帧放进队列，让人用最少点/框修正，并用 `interactions_per_video_minute` 衡量人工成本。
+项目定位：MaskReview 是 SAM2 传播后的复核闭环。系统自动标注先跑完，只把低置信或疑似漂移帧放进队列，让人用最少点/框修正，并用 `interactions_per_video_minute` 衡量人工成本。
 
 ## 状态说明
 
@@ -15,7 +15,7 @@
 
 | ID | 模块 | 目标 | 当前产物 | 状态 | 验收方式 | 下一步 |
 | --- | --- | --- | --- | --- | --- | --- |
-| P0 | 项目定位 | 从通用标注工具收窄到 SAM2 propagation review loop | `README.md`, `docs/research_plan.md` | Done | 第一屏明确低置信帧队列、最少交互、CVAT 插件/本地工具形态 | 后续所有功能都围绕复核闭环，不扩成通用标注平台 |
+| P0 | 项目定位 | 从通用标注工具收窄到 MaskReview: SAM2 propagation review loop | `README.md`, `docs/research_plan.md` | Done | 第一屏明确低置信帧队列、最少交互、CVAT 插件/本地工具形态 | 后续所有功能都围绕复核闭环，不扩成通用标注平台 |
 | P1 | SAM2 baseline | 第一帧框输入后跑完整视频传播 | `src/sam2_runner.py`, `src/pipeline.py` | Done | 能输出 `overlay.mp4`, `masks/`, `metrics.json` | 在 GPU 环境跑真实 SAM2 sample |
 | P2 | Review queue | 把疑似漂移帧转成可操作队列 | `review_queue.json`, `build_review_queue()` | Done | 单元测试覆盖面积突变、空 mask 队列项和输出路径 | 加入 SAM2 logits、边界漂移等更强低置信信号 |
 | P3 | 成本指标 | 记录最少人工交互成本 | `estimated_min_interactions`, `estimated_interactions_per_video_minute` | Done | `tests/test_pipeline.py` 验证指标写入 result 和 metrics | 后续用真实人工修正次数替代 estimate |

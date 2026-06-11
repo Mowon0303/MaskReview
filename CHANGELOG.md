@@ -7,6 +7,7 @@ All notable changes to this project are documented here.
 ### Added
 
 - Initialized the project around the SAM2 propagation review-loop positioning.
+- Named the project `MaskReview` for the GitHub repository and product-facing documentation.
 - Added `review_queue.json` generation for low-confidence or suspicious propagation frames.
 - Added review queue items with `frame_index`, `reason`, `frame_path`, `mask_path`, `recommended_correction`, and `estimated_interactions`.
 - Added `estimated_min_interactions`, `video_duration_seconds`, and `estimated_interactions_per_video_minute` to `metrics.json`.
