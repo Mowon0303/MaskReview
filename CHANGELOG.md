@@ -42,6 +42,11 @@ All notable changes to this project are documented here.
 - Reframed the project from a broad promptable video annotation/editing tool into a narrow SAM2 propagation review loop.
 - Rewrote `README.md` to emphasize low-confidence frame review, minimal human correction, CVAT plugin potential, and interaction-cost metrics.
 - Rewrote `docs/research_plan.md` around the MVP path: local review pass, minimal correction, evaluation, then CVAT plugin.
+- Moved the design handoff files into `docs/design_handoff_maskreview/`.
+
+### Fixed
+
+- Manifest paths from `make_relative_path` are now always written with POSIX separators, so manifests generated on Windows resolve correctly on macOS/Linux (previously caused `FileNotFoundError` during evaluation).
 
 ### Verified
 

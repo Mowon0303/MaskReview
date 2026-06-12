@@ -136,10 +136,11 @@ def inspect_video(video_path: Path, first_frame_path: Optional[Path] = None) -> 
 
 
 def make_relative_path(path: Path, base_dir: Path) -> str:
+    # Manifests are shared across OSes, so always emit POSIX separators.
     try:
-        return str(Path(path).resolve().relative_to(Path(base_dir).resolve()))
+        return Path(path).resolve().relative_to(Path(base_dir).resolve()).as_posix()
     except ValueError:
-        return str(path)
+        return Path(path).as_posix()
 
 
 def sanitize_case_id(raw_case_id: str) -> str:

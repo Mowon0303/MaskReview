@@ -59,9 +59,9 @@ class ManifestTemplateTest(unittest.TestCase):
             manifest = json.loads(output_path.read_text(encoding="utf-8"))
             case = manifest["cases"][0]
             self.assertEqual(case["id"], "cup_sample")
-            self.assertEqual(case["video_path"], "eval_videos\\cup sample.mp4")
+            self.assertEqual(case["video_path"], "eval_videos/cup sample.mp4")
             self.assertIsNone(case["init_box_xyxy"])
-            self.assertEqual(case["first_frame_path"], "eval_first_frames\\cup_sample.jpg")
+            self.assertEqual(case["first_frame_path"], "eval_first_frames/cup_sample.jpg")
             self.assertEqual(case["video_metadata"]["width"], 640)
 
             with self.assertRaises(FileExistsError):
