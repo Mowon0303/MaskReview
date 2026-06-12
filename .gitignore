@@ -1,11 +1,19 @@
 __pycache__/
 *.py[cod]
+*.zip
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.venv/
+.tmp/
+.pip-cache/
 checkpoints/*.pt
 outputs/*
 !outputs/.gitkeep
 data/samples/*
 !data/samples/.gitkeep
+data/eval_videos/*
+!data/eval_videos/.gitkeep
+data/eval_first_frames/*
+!data/eval_first_frames/.gitkeep
 

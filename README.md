@@ -19,7 +19,7 @@ MaskReview 是一个用于自动传播视频 mask 的复核工作台。它不是
 本项目收窄到一条闭环：
 
 1. 第一帧给框，启动 SAM2 传播。
-2. 用面积突变、空 mask、置信度信号等规则发现疑似漂移帧。
+2. 用面积突变、空 mask、中心点跳变、贴边、帧间 mask IoU 等规则发现疑似漂移帧。
 3. 生成低置信帧队列 `review_queue.json`。
 4. 每个队列帧只请求一次最小修正：一个正/负点或一个更紧的框。
 5. 记录 `estimated_min_interactions` 和 `estimated_interactions_per_video_minute`。
@@ -43,12 +43,19 @@ outputs/<run_id>/
   overlay.mp4
   review_queue.json
   metrics.json
+  corrections.json
+  masks_after/
+  overlay_after.mp4
+  review_queue_after.json
+  metrics_after.json
+  comparison.json
 ```
 
 `review_queue.json` 的每个 item 代表一个需要人工复核的帧，包含：
 
 - `frame_index`
 - `reason`
+- `reasons`
 - `frame_path`
 - `mask_path`
 - `recommended_correction`
@@ -57,10 +64,120 @@ outputs/<run_id>/
 `metrics.json` 里重点看：
 
 - `review_frame_indices`
+- `review_reason_counts`
 - `estimated_min_interactions`
 - `video_duration_seconds`
 - `estimated_interactions_per_video_minute`
 - `review_policy`
+
+保存人工修正后，`corrections.json` 会记录每个复核帧的一次修正：
+
+- `frame_index`
+- `type`: `positive_point`、`negative_point` 或 `tight_box`
+- `points` 或 `box_xyxy`
+- `created_at`
+- `estimated_interactions`
+
+点击重传播后，系统会输出 `overlay_after.mp4`、`metrics_after.json` 和 `comparison.json`，用于对比修正前后的队列数量、人工交互次数和 mask 面积变化。
+
+## Evaluation harness
+
+批量评估用 manifest 驱动。可以先复制 `data/eval_manifest.example.json` 为 `data/eval_manifest.json`，也可以先把真实短视频放进 `data/eval_videos/`，再生成待填写的模板。
+
+### Manifest template
+
+真实视频放进 `data/eval_videos/` 后，先跑：
+
+```bash
+python scripts/generate_eval_manifest_template.py \
+  --video-dir data/eval_videos \
+  --output data/eval_manifest.template.json \
+  --first-frame-dir data/eval_first_frames \
+  --overwrite
+```
+
+脚本会扫描 `.mp4`、`.mov`、`.avi`、`.mkv`、`.webm` 等视频，导出每段视频的第一帧到 `data/eval_first_frames/`，并写出 `data/eval_manifest.template.json`。然后手动补齐每个 case 的：
+
+- `init_box_xyxy`：第一帧目标框，格式 `[x1, y1, x2, y2]`。
+- `object_name`：目标名称。
+- `expected_challenge`：`clean_tracking`、`occlusion`、`similar_object_drift` 等分组标签。
+- `expected_review_frames`：可选，人工认为应该进入复核队列的帧，例如 `[12, 18, 19]` 或 `"12,18-19"`。不确定时保留 `null`。
+
+补完后保存为 `data/eval_manifest.json`，再跑评估：
+
+```bash
+python scripts/run_evaluation.py data/eval_manifest.json \
+  --output-dir outputs/evaluation \
+  --fixed-interval 10 \
+  --sam2-checkpoint checkpoints/sam2.1_hiera_tiny.pt
+```
+
+输出：
+
+```text
+outputs/evaluation/
+  evaluation_results.csv
+  evaluation_report.md
+  <case_id>/
+    overlay.mp4
+    metrics.json
+    corrections.json
+    overlay_after.mp4
+    metrics_after.json
+    comparison.json
+```
+
+`evaluation_results.csv` 会把 MaskReview queue 和固定间隔复核 baseline 放在同一行里比较，重点看 `queue_reason_counts`、`queue_estimated_interactions`、`fixed_interval_review_frames` 和 `saved_interactions_vs_fixed_interval`。
+
+如果 manifest 里填写了 `expected_review_frames`，报告还会输出：
+
+- `queue_precision` / `queue_recall` / `queue_f1`：review queue 对人工标签的命中质量。
+- `queue_missed_expected_frames`：人工认为该复核但队列漏掉的帧数。
+- `queue_false_positives`：队列叫人复核但人工标签里没有的帧数。
+- `fixed_interval_precision` / `fixed_interval_recall` / `fixed_interval_f1`：固定间隔 baseline 的同口径对照。
+
+### Threshold calibration
+
+评估时可以显式指定低置信队列阈值：
+
+```bash
+python scripts/run_evaluation.py data/eval_manifest.json \
+  --output-dir outputs/evaluation-default \
+  --area-jump-ratio 0.6 \
+  --center-jump-ratio 0.25 \
+  --iou-drop-threshold 0.2 \
+  --area-decline-ratio 0.35 \
+  --edge-margin 0
+```
+
+也可以一次跑三档校准策略：
+
+```bash
+python scripts/run_evaluation.py data/eval_manifest.json \
+  --output-dir outputs/threshold-calibration \
+  --fixed-interval 10 \
+  --sam2-checkpoint checkpoints/sam2.1_hiera_tiny.pt \
+  --calibrate
+```
+
+输出：
+
+```text
+outputs/threshold-calibration/
+  threshold_calibration.csv
+  threshold_calibration_report.md
+  sensitive/
+  default/
+  conservative/
+```
+
+三档策略含义：
+
+- `sensitive`：少漏检，可能多叫人复核。
+- `default`：当前默认平衡点。
+- `conservative`：少叫人复核，可能漏掉更多漂移。
+
+有 `expected_review_frames` 标签时，阈值选择优先看 `queue_recall` 和 `queue_missed_expected_frames`，再看 `saved_interactions_vs_fixed_interval`。没有标签时，校准只能说明复核量差异，不能证明漏检率。
 
 ## 运行方式
 
@@ -122,19 +239,34 @@ MVP 不证明“我也会做标注工具”，只证明这一点：
 ## 当前文件结构
 
 ```text
-promptable-video-segmentation/
+maskreview/
   README.md
+  PLAN_TRACKER.md
   docs/
     research_plan.md
+    landing_readiness.md
+  data/
+    eval_manifest.example.json
+    eval_first_frames/
+    eval_videos/
   src/
     app.py
+    corrections.py
+    evaluation.py
+    manifest_template.py
     pipeline.py
     sam2_runner.py
     video_io.py
   scripts/
     download_sam2_checkpoint.py
+    generate_eval_manifest_template.py
+    run_evaluation.py
     prepare_sample_video.py
   tests/
+    test_app.py
+    test_corrections.py
+    test_evaluation.py
+    test_manifest_template.py
     test_pipeline.py
   outputs/
 ```

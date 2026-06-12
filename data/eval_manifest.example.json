@@ -1,0 +1,20 @@
+{
+  "cases": [
+    {
+      "id": "synthetic_square",
+      "video_path": "samples/synthetic_square.mp4",
+      "object_name": "white square",
+      "init_box_xyxy": [72, 86, 126, 140],
+      "expected_challenge": "clean_tracking",
+      "expected_review_frames": null,
+      "notes": "Synthetic smoke case for validating the eval harness.",
+      "corrections": [
+        {
+          "frame_index": 4,
+          "type": "positive_point",
+          "point_xy": [142, 149]
+        }
+      ]
+    }
+  ]
+}

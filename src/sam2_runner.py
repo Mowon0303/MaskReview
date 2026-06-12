@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -27,16 +28,37 @@ class Sam2VideoSegmenter:
         init_box_xyxy: tuple[int, int, int, int],
         frame_count: int,
     ) -> dict[int, np.ndarray]:
+        return self.segment_with_corrections(
+            frame_dir=frame_dir,
+            init_box_xyxy=init_box_xyxy,
+            frame_count=frame_count,
+            corrections=[],
+        )
+
+    def segment_with_corrections(
+        self,
+        frame_dir: Path,
+        init_box_xyxy: tuple[int, int, int, int],
+        frame_count: int,
+        corrections: list[dict[str, Any]],
+    ) -> dict[int, np.ndarray]:
         torch = self._import_torch()
         predictor = self._load_predictor()
         box = np.array(init_box_xyxy, dtype=np.float32)
 
         with torch.inference_mode(), self._autocast_context(torch):
             state = self._init_state(predictor, frame_dir)
-            self._add_box_prompt(predictor, state, box)
+            self._add_box_prompt(predictor, state, frame_idx=0, box=box)
+            for correction in sorted(corrections, key=lambda item: int(item["frame_index"])):
+                self._add_correction_prompt(predictor, state, correction)
 
             masks: dict[int, np.ndarray] = {}
-            for output in predictor.propagate_in_video(state):
+            for output in predictor.propagate_in_video(
+                state,
+                start_frame_idx=0,
+                max_frame_num_to_track=frame_count,
+                reverse=False,
+            ):
                 frame_idx, obj_ids, mask_logits = output[:3]
                 mask = self._select_object_mask(obj_ids, mask_logits)
                 if mask is not None:
@@ -95,16 +117,76 @@ class Sam2VideoSegmenter:
         except TypeError:
             return predictor.init_state(video_path=str(frame_dir))
 
-    def _add_box_prompt(self, predictor, state, box: np.ndarray) -> None:
+    def _add_box_prompt(self, predictor, state, frame_idx: int, box: np.ndarray) -> None:
         try:
             predictor.add_new_points_or_box(
                 inference_state=state,
-                frame_idx=0,
+                frame_idx=frame_idx,
                 obj_id=self.obj_id,
                 box=box,
             )
         except TypeError:
-            predictor.add_new_points_or_box(state, 0, self.obj_id, box=box)
+            predictor.add_new_points_or_box(state, frame_idx, self.obj_id, box=box)
+
+    def _add_point_prompt(
+        self,
+        predictor,
+        state,
+        frame_idx: int,
+        point_xy: tuple[float, float],
+        label: int,
+        clear_old_points: bool = True,
+    ) -> None:
+        points = np.array([point_xy], dtype=np.float32)
+        labels = np.array([label], dtype=np.int32)
+        try:
+            predictor.add_new_points_or_box(
+                inference_state=state,
+                frame_idx=frame_idx,
+                obj_id=self.obj_id,
+                points=points,
+                labels=labels,
+                clear_old_points=clear_old_points,
+            )
+        except TypeError:
+            predictor.add_new_points_or_box(
+                state,
+                frame_idx,
+                self.obj_id,
+                points=points,
+                labels=labels,
+                clear_old_points=clear_old_points,
+            )
+
+    def _add_correction_prompt(self, predictor, state, correction: dict[str, Any]) -> None:
+        frame_idx = int(correction["frame_index"])
+        correction_type = str(correction["type"])
+        if correction_type == "tight_box":
+            self._add_box_prompt(
+                predictor,
+                state,
+                frame_idx=frame_idx,
+                box=np.array(correction["box_xyxy"], dtype=np.float32),
+            )
+            return
+
+        if correction_type in {"positive_point", "negative_point"}:
+            points = correction.get("points") or []
+            if not points:
+                raise ValueError(f"Point correction has no points: {correction}")
+            point = points[0]
+            label = 1 if correction_type == "positive_point" else 0
+            self._add_point_prompt(
+                predictor,
+                state,
+                frame_idx=frame_idx,
+                point_xy=(float(point["x"]), float(point["y"])),
+                label=label,
+                clear_old_points=frame_idx != 0,
+            )
+            return
+
+        raise ValueError(f"Unsupported correction type: {correction_type}")
 
     def _select_object_mask(self, obj_ids, mask_logits) -> np.ndarray | None:
         obj_id_list = [int(obj_id) for obj_id in obj_ids]
