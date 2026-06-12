@@ -1,0 +1,29 @@
+{
+  "instructions": [
+    "Fill init_box_xyxy before running evaluation.",
+    "Use first_frame_path to inspect the first frame for each video.",
+    "Set expected_challenge to clean_tracking, occlusion, target_loss, similar_object, scale_change, or camera_motion.",
+    "Optionally fill expected_review_frames after manual inspection to score queue precision/recall.",
+    "Optional corrections can be added after reviewing baseline output."
+  ],
+  "cases": [
+    {
+      "id": "pill_bottle_hand",
+      "video_path": "eval_videos/pill_bottle_hand.mp4",
+      "object_name": "ibuprofen bottle",
+      "init_box_xyxy": [340, 510, 678, 1205],
+      "expected_challenge": "target_loss",
+      "expected_review_frames": [16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42],
+      "notes": "Handheld ibuprofen bottle, iPhone vertical video trimmed to start at original frame 30. Bottle exits right edge ~new frame 16, fully absent ~20-40, re-enters from right edge ~40-45 with strong motion blur. Black cat on bed as potential dark distractor.",
+      "first_frame_path": "eval_first_frames/pill_bottle_hand.jpg",
+      "video_metadata": {
+        "width": 1080,
+        "height": 1920,
+        "frame_count": 358,
+        "fps": 29.985,
+        "duration_seconds": 11.939
+      },
+      "corrections": []
+    }
+  ]
+}
