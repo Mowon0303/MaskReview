@@ -68,11 +68,15 @@ def build_correction(
             correction["mask_path"] = review_item["mask_path"]
 
     if correction_type in POINT_CORRECTION_TYPES:
-        points = parse_points_xy(point_xy)
-        label = "positive" if correction_type == "positive_point" else "negative"
-        correction["points"] = [{"x": x, "y": y, "label": label} for x, y in points]
+        parsed = parse_points_xy(point_xy)
+        # Each click may carry its own +/- label (mixed corrections); points without an
+        # explicit label fall back to the correction_type's polarity (back-compatible).
+        default_label = "positive" if correction_type == "positive_point" else "negative"
+        correction["points"] = [
+            {"x": x, "y": y, "label": label or default_label} for x, y, label in parsed
+        ]
         # one human interaction per click — a hard frame may need several points
-        correction["estimated_interactions"] = len(points)
+        correction["estimated_interactions"] = len(parsed)
     else:
         correction["box_xyxy"] = list(parse_box_xyxy(box_xyxy))
 
@@ -83,22 +87,46 @@ def build_correction(
     return correction
 
 
+_POINT_LABEL_ALIASES = {
+    "p": "positive", "+": "positive", "pos": "positive", "positive": "positive", "1": "positive",
+    "n": "negative", "-": "negative", "neg": "negative", "negative": "negative", "0": "negative",
+}
+
+
 def parse_point_xy(raw_point: str) -> tuple[int, int]:
-    values = _parse_int_csv(raw_point)
-    if len(values) != 2:
-        raise ValueError("Point must be formatted as x,y.")
-    x, y = values
-    if x < 0 or y < 0:
-        raise ValueError("Point coordinates must be non-negative.")
+    x, y, _label = parse_labeled_point(raw_point)
     return x, y
 
 
-def parse_points_xy(raw_points: str) -> list[tuple[int, int]]:
-    """Parse one or more points: 'x,y' or 'x1,y1;x2,y2;...' (one click each)."""
+def parse_labeled_point(raw_point: str) -> tuple[int, int, Optional[str]]:
+    """Parse 'x,y' or 'x,y,label'; label is one of: + - p n pos neg positive negative.
+
+    Returns (x, y, label) with label None when the point carries no explicit polarity.
+    """
+    tokens = [token.strip() for token in raw_point.split(",") if token.strip()]
+    if len(tokens) not in (2, 3):
+        raise ValueError("Point must be formatted as x,y or x,y,label.")
+    try:
+        x, y = int(tokens[0]), int(tokens[1])
+    except ValueError as exc:
+        raise ValueError("Point coordinates must be integers.") from exc
+    if x < 0 or y < 0:
+        raise ValueError("Point coordinates must be non-negative.")
+    label: Optional[str] = None
+    if len(tokens) == 3:
+        key = tokens[2].lower()
+        if key not in _POINT_LABEL_ALIASES:
+            raise ValueError("Point label must be one of: + - p n pos neg positive negative.")
+        label = _POINT_LABEL_ALIASES[key]
+    return x, y, label
+
+
+def parse_points_xy(raw_points: str) -> list[tuple[int, int, Optional[str]]]:
+    """Parse one or more points: 'x,y' / 'x,y,label', separated by ';' (one click each)."""
     chunks = [chunk for chunk in raw_points.split(";") if chunk.strip()]
     if not chunks:
         raise ValueError("At least one point is required, formatted as x,y or x1,y1;x2,y2.")
-    return [parse_point_xy(chunk) for chunk in chunks]
+    return [parse_labeled_point(chunk) for chunk in chunks]
 
 
 def parse_box_xyxy(raw_box: str) -> tuple[int, int, int, int]:

@@ -296,6 +296,12 @@ html, body, .gradio-container {
   border-radius: 8px;
   background: var(--mr-bg2);
   padding: 9px 10px;
+  cursor: pointer;
+  transition: border-color .12s ease, background .12s ease;
+}
+.mr-qitem:hover {
+  border-color: var(--mr-orange);
+  background: var(--mr-bg3);
 }
 .mr-qtop {
   display: flex;
@@ -458,6 +464,32 @@ html, body, .gradio-container {
 @media (max-width: 1100px) {
   .mr-kpi-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .mr-topbar { flex-wrap: wrap; height: auto; min-height: 48px; padding: 8px 14px; }
+}
+.mr-hidden { display: none !important; }
+"""
+
+
+# Installed once on page load: a delegated click listener that turns a click on any review-queue
+# card into a frame selection. The card carries its frame index in data-frame; the listener writes
+# it into the hidden #mr-queue-click textbox and notifies Gradio, which fires queue_click.change.
+# Using a data attribute + trusted load-time listener (rather than inline onclick) survives any
+# frontend HTML sanitization and avoids per-card script.
+MASKREVIEW_JS = """
+() => {
+  if (window.__mrQueueBound) return;
+  window.__mrQueueBound = true;
+  document.addEventListener('click', (e) => {
+    const card = e.target && e.target.closest ? e.target.closest('.mr-qitem') : null;
+    if (!card) return;
+    const frame = card.getAttribute('data-frame');
+    if (frame === null) return;
+    const box = document.querySelector('#mr-queue-click textarea')
+      || document.querySelector('#mr-queue-click input');
+    if (!box) return;
+    box.value = frame;
+    box.dispatchEvent(new Event('input', { bubbles: true }));
+    box.dispatchEvent(new Event('change', { bubbles: true }));
+  });
 }
 """
 
@@ -638,7 +670,7 @@ def render_review_queue_html(review_queue: list[dict[str, Any]]) -> str:
         confidence = max(0.02, 1.0 - risk)
         cards.append(
             """
-<div class="mr-qitem">
+<div class="mr-qitem" data-frame="{frame}" title="Click to inspect & correct frame {frame}">
   <div class="mr-qtop">
     <span class="mr-risk" style="background:{risk_color}"></span>
     <span class="mr-frame">f{frame}<span> · risk {risk:.2f}</span></span>
@@ -794,15 +826,80 @@ def save_selected_correction(
     )
     path = save_correction(Path(run_state["run_dir"]), correction)
     corrections = load_corrections(Path(run_state["run_dir"]))
-    status = f"Saved {correction_type} for frame {correction['frame_index']} to {path}"
+    if "points" in correction:
+        npos = sum(1 for p in correction["points"] if p.get("label") == "positive")
+        nneg = len(correction["points"]) - npos
+        detail = f"{npos} positive + {nneg} negative point(s)"
+    else:
+        detail = "tight box"
+    status = f"Saved frame {correction['frame_index']} correction ({detail}) -> {path}"
     return corrections, status
 
 
-def apply_point_click(point_text: str, x: int, y: int) -> str:
-    """Append a clicked (x, y) to the multi-point text ('x,y;x,y'); one click = one point."""
-    chunk = f"{int(x)},{int(y)}"
+def apply_point_click(point_text: str, x: int, y: int, label: str = "p") -> str:
+    """Append a clicked point as 'x,y,L' (L = p positive / n negative); one click = one point.
+
+    The per-click label lets a single correction mix positive and negative points.
+    """
+    tag = "n" if str(label).lower().startswith("n") else "p"
+    chunk = f"{int(x)},{int(y)},{tag}"
     existing = (point_text or "").strip().strip(";")
     return f"{existing};{chunk}" if existing else chunk
+
+
+def render_staged_frame(frame_path: Any, point_text: str, box_text: str):
+    """Overlay staged correction inputs on the frame for visual feedback.
+
+    Green '+' = positive point, red '-' = negative point, cyan = tight box / pending corner.
+    Returns an RGB ndarray when there is something to draw, else the original frame path.
+    Display-only: the saved correction is computed from the raw coordinates/labels, never this image.
+    """
+    if not frame_path or not Path(str(frame_path)).exists():
+        return frame_path
+    points_text = (point_text or "").strip()
+    box_raw = (box_text or "").strip()
+    if not points_text and not box_raw:
+        return frame_path
+
+    import cv2
+
+    img = cv2.imread(str(frame_path))
+    if img is None:
+        return frame_path
+    height, width = img.shape[:2]
+    radius = max(7, width // 70)
+    thickness = max(2, width // 240)
+    cyan = (255, 255, 0)  # BGR
+
+    box_vals = [int(v) for v in box_raw.replace(";", ",").split(",") if v.strip().isdigit()]
+    if len(box_vals) >= 4:
+        x1, y1, x2, y2 = box_vals[:4]
+        cv2.rectangle(img, (x1, y1), (x2, y2), cyan, thickness)
+    elif len(box_vals) == 2:  # one corner clicked, second pending
+        cv2.circle(img, (box_vals[0], box_vals[1]), radius, cyan, thickness)
+
+    try:
+        from corrections import parse_points_xy
+
+        staged = parse_points_xy(points_text) if points_text else []
+    except ValueError:
+        staged = []
+    for x, y, label in staged:
+        positive = (label or "positive") == "positive"
+        color = (0, 200, 0) if positive else (40, 40, 220)  # BGR: green / red
+        cv2.circle(img, (x, y), radius, color, -1)
+        cv2.circle(img, (x, y), radius, (0, 0, 0), thickness)
+        cv2.putText(
+            img,
+            "+" if positive else "-",
+            (x - radius // 2, y + radius // 2),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            radius / 16.0,
+            (255, 255, 255),
+            thickness,
+        )
+
+    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
 
 def apply_box_click(box_text: str, x: int, y: int) -> str:
@@ -818,14 +915,48 @@ def apply_box_click(box_text: str, x: int, y: int) -> str:
     return f"{x},{y}"
 
 
-def on_frame_click(correction_type: str, point_text: str, box_text: str, evt: "gr.SelectData"):
-    """Frame-click handler: stage a point (point modes) or a box corner (tight_box) into the textboxes."""
-    if evt is None or getattr(evt, "index", None) is None:
-        return point_text, box_text
-    x, y = int(evt.index[0]), int(evt.index[1])
-    if correction_type == "tight_box":
-        return point_text, apply_box_click(box_text, x, y)
-    return apply_point_click(point_text, x, y), box_text
+def on_frame_click(
+    correction_type: str,
+    point_text: str,
+    box_text: str,
+    frame_value: Any,
+    run_state: Optional[dict[str, Any]],
+    evt: "gr.SelectData",
+):
+    """Frame-click handler: stage a point (labeled by the active tool) or a box corner, then
+    redraw all staged inputs on the frame so the user sees the green +/red - dots they placed."""
+    new_points, new_box = point_text, box_text
+    if evt is not None and getattr(evt, "index", None) is not None:
+        x, y = int(evt.index[0]), int(evt.index[1])
+        if correction_type == "tight_box":
+            new_box = apply_box_click(box_text, x, y)
+        else:
+            label = "n" if correction_type == "negative_point" else "p"
+            new_points = apply_point_click(point_text, x, y, label)
+    frame_path, _mask, _item = load_review_frame(frame_value, run_state)
+    return new_points, new_box, render_staged_frame(frame_path, new_points, new_box)
+
+
+def select_review_frame(frame_value: Any, run_state: Optional[dict[str, Any]]):
+    """Switch the inspected frame, clearing any staged point/box inputs.
+
+    A correction belongs to exactly one frame, so the previous frame's clicked
+    coordinates must not carry over when the user moves to another frame — otherwise
+    they get appended to the next frame's points and saved into the wrong correction.
+    """
+    frame_path, mask_path, item = load_review_frame(frame_value, run_state)
+    return frame_path, mask_path, item, "", ""
+
+
+def on_queue_click(frame_value: Any, run_state: Optional[dict[str, Any]]):
+    """Bridge a review-queue card click into a frame selection.
+
+    Syncs the dropdown value (so the save handler targets the clicked frame), loads the
+    frame/mask, and clears staged point/box inputs — same reset as a dropdown switch.
+    """
+    frame_path, mask_path, item = load_review_frame(frame_value, run_state)
+    selected = str(int(frame_value)) if frame_value not in (None, "") else None
+    return selected, frame_path, mask_path, item, "", ""
 
 
 def build_correction_runner(pipeline: PromptableVideoSegmentationPipeline):
@@ -920,6 +1051,8 @@ def build_runner(
             [],
             {},
             {},
+            "",
+            "",
         )
 
     return run_demo
@@ -954,6 +1087,15 @@ def build_demo(args: argparse.Namespace):
                         run_button = gr.Button("Run review pass", variant="primary")
                         gr.HTML('<div class="mr-panel-title"><span>Review queue</span><span class="chip">pending</span></div>')
                         review_queue = gr.HTML(render_review_queue_html([]))
+                        # Hidden bridge: queue-card clicks (see MASKREVIEW_JS) write a frame index
+                        # here; its .change drives selection without leaving the styled queue.
+                        queue_click = gr.Textbox(
+                            value="",
+                            elem_id="mr-queue-click",
+                            elem_classes=["mr-hidden"],
+                            show_label=False,
+                            interactive=True,
+                        )
                         review_frame = gr.Dropdown(
                             label="Queued frame",
                             choices=[],
@@ -984,17 +1126,17 @@ def build_demo(args: argparse.Namespace):
                         gr.HTML('<div class="mr-panel-title"><span>Correction</span><span class="chip">click frame · point/box</span></div>')
                         correction_type = gr.Radio(
                             choices=[
-                                ("Positive point", "positive_point"),
-                                ("Negative point", "negative_point"),
+                                ("Positive point (+)", "positive_point"),
+                                ("Negative point (−)", "negative_point"),
                                 ("Tight box", "tight_box"),
                             ],
                             value="positive_point",
-                            label="Correction type",
+                            label="Click tool · what the next frame-click adds",
                         )
-                        gr.HTML('<div class="mr-viewer-note">Click the source frame above to add point(s); for a tight box click two opposite corners. Clicks fill the fields below (still editable).</div>')
+                        gr.HTML('<div class="mr-viewer-note">Pick a tool, then click the source frame: <b style="color:#3ddc97">Positive</b> drops a green <b>+</b>, <b style="color:#ff4d5e">Negative</b> drops a red <b>−</b>. Switch tools between clicks to mix them; for a tight box click two opposite corners. Dots show on the frame; fields below stay editable.</div>')
                         point_xy = gr.Textbox(
-                            label="Point(s) · x,y px (use ; for several clicks)",
-                            placeholder="120,180  or  120,180;200,90",
+                            label="Point(s) · x,y,±  (green + / red − shown on frame)",
+                            placeholder="120,180,p; 200,90,n",
                         )
                         correction_box = gr.Textbox(
                             label="Tight box · x1,y1,x2,y2",
@@ -1043,17 +1185,31 @@ def build_demo(args: argparse.Namespace):
                 corrected_review_queue,
                 corrected_metrics,
                 correction_comparison,
+                point_xy,
+                correction_box,
             ],
         )
         review_frame.change(
-            load_review_frame,
+            select_review_frame,
             inputs=[review_frame, run_state],
-            outputs=[review_frame_image, review_mask_image, selected_review_item],
+            outputs=[review_frame_image, review_mask_image, selected_review_item, point_xy, correction_box],
+        )
+        queue_click.change(
+            on_queue_click,
+            inputs=[queue_click, run_state],
+            outputs=[
+                review_frame,
+                review_frame_image,
+                review_mask_image,
+                selected_review_item,
+                point_xy,
+                correction_box,
+            ],
         )
         review_frame_image.select(
             on_frame_click,
-            inputs=[correction_type, point_xy, correction_box],
-            outputs=[point_xy, correction_box],
+            inputs=[correction_type, point_xy, correction_box, review_frame, run_state],
+            outputs=[point_xy, correction_box, review_frame_image],
         )
         save_button.click(
             save_selected_correction,
@@ -1071,6 +1227,9 @@ def build_demo(args: argparse.Namespace):
                 correction_comparison,
             ],
         )
+
+        # Install the delegated queue-card click listener once the page loads.
+        demo.load(fn=None, js=MASKREVIEW_JS)
 
     return demo
 

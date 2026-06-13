@@ -59,6 +59,28 @@ class CorrectionsTest(unittest.TestCase):
         # one human interaction per click — a hard frame may need several points
         self.assertEqual(correction["estimated_interactions"], 3)
 
+    def test_build_mixed_point_labels_per_click(self) -> None:
+        # a single correction can carry both positive and negative points (the real fix:
+        # one + on the object, several - on background/occluder to carve the mask down)
+        correction = build_correction(
+            frame_index=5,
+            correction_type="positive_point",
+            point_xy="10,20,p;30,40,n;50,60,n",
+        )
+        self.assertEqual(
+            [p["label"] for p in correction["points"]],
+            ["positive", "negative", "negative"],
+        )
+        self.assertEqual(correction["estimated_interactions"], 3)
+
+    def test_unlabeled_points_fall_back_to_correction_type(self) -> None:
+        correction = build_correction(
+            frame_index=5,
+            correction_type="negative_point",
+            point_xy="10,20;30,40",
+        )
+        self.assertEqual([p["label"] for p in correction["points"]], ["negative", "negative"])
+
     def test_rejects_invalid_correction_inputs(self) -> None:
         with self.assertRaises(ValueError):
             build_correction(frame_index=0, correction_type="positive_point", point_xy="1")
