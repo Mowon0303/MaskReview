@@ -240,12 +240,23 @@ def queue_to_issues(
 def interaction_report(
     review_queue: list[dict[str, Any]],
     resolved_issue_count: int,
+    issues_created: Optional[int] = None,
 ) -> dict[str, Any]:
-    """Compare MaskReview's estimate against what the annotator actually resolved in CVAT."""
+    """Compare MaskReview's estimate against what the annotator actually resolved in CVAT.
+
+    When ``issues_created`` is given (issues currently on the task), also reports review
+    coverage = resolved / created — how much of the flagged work the human has addressed.
+    """
     estimated = sum(int(item.get("estimated_interactions", 1)) for item in review_queue)
-    return {
+    report = {
         "queued_frames": len(review_queue),
         "estimated_interactions": estimated,
         "resolved_issues": int(resolved_issue_count),
         "delta_vs_estimate": int(resolved_issue_count) - estimated,
     }
+    if issues_created is not None:
+        report["issues_created"] = int(issues_created)
+        report["review_coverage"] = (
+            round(int(resolved_issue_count) / issues_created, 3) if issues_created else None
+        )
+    return report

@@ -180,6 +180,22 @@ class CvatBridge:
                 created += 1
         return created
 
+    def count_issues(self, task_id: int) -> dict[str, int]:
+        """Count issues on the task's job, total and resolved (paginated)."""
+        with make_client(self._host, credentials=self._credentials) as client:
+            task = client.tasks.retrieve(task_id)
+            job_id = int(task.get_jobs()[0].id)
+            issues: list = []
+            page = 1
+            while True:
+                data, _ = client.api_client.issues_api.list(job_id=job_id, page=page, page_size=100)
+                issues.extend(data.results)
+                if len(issues) >= int(data.count) or not data.results:
+                    break
+                page += 1
+        resolved = sum(1 for i in issues if bool(getattr(i, "resolved", False)))
+        return {"total": len(issues), "resolved": resolved}
+
     # --- export ---------------------------------------------------------------
 
     def export_annotations(

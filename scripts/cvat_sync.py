@@ -16,6 +16,7 @@ See docs/cvat_plugin.md.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import tempfile
@@ -34,6 +35,11 @@ from pipeline import (  # noqa: E402
     build_review_queue,
 )
 from sam2_runner import Sam2VideoSegmenter  # noqa: E402
+
+
+def _review_sidecar(task_id: int) -> Path:
+    """Local file where `push` records the review estimate so `stats` can compare later."""
+    return Path("outputs") / "cvat" / f"task_{task_id}_review.json"
 
 
 def _bridge() -> CvatBridge:
@@ -110,6 +116,32 @@ def cmd_push(args: argparse.Namespace) -> None:
     print(f"created {created} CVAT issues (min_score={args.min_score}); "
           f"estimated_interactions={report['estimated_interactions']}")
 
+    sidecar = _review_sidecar(args.task_id)
+    sidecar.parent.mkdir(parents=True, exist_ok=True)
+    sidecar.write_text(json.dumps({
+        "task_id": args.task_id,
+        "queued_frames": len(queue),
+        "estimated_interactions": report["estimated_interactions"],
+        "issues_created": created,
+        "review_queue": queue,
+    }, default=str), encoding="utf-8")
+    print(f"wrote review estimate -> {sidecar}")
+
+
+def cmd_stats(args: argparse.Namespace) -> None:
+    sidecar = _review_sidecar(args.task_id)
+    if not sidecar.exists():
+        raise SystemExit(f"No review estimate at {sidecar}. Run `push --task-id {args.task_id}` first.")
+    saved = json.loads(sidecar.read_text(encoding="utf-8"))
+    counts = _bridge().count_issues(args.task_id)
+    report = interaction_report(saved["review_queue"], counts["resolved"], issues_created=counts["total"])
+    print(f"task {args.task_id} interaction report:")
+    print(f"  queued frames        : {report['queued_frames']}")
+    print(f"  estimated interactions: {report['estimated_interactions']}")
+    print(f"  issues on task        : {report['issues_created']}")
+    print(f"  issues resolved       : {report['resolved_issues']}")
+    print(f"  review coverage       : {report['review_coverage']}")
+
 
 def cmd_export(args: argparse.Namespace) -> None:
     out = _bridge().export_annotations(args.task_id, Path(args.out))
@@ -133,6 +165,10 @@ def main() -> None:
     push.add_argument("--sam2-model-cfg", default=DEFAULT_SAM2_MODEL_CFG)
     push.add_argument("--sam2-checkpoint", default=str(DEFAULT_SAM2_CHECKPOINT))
     push.set_defaults(func=cmd_push)
+
+    stats = sub.add_parser("stats", help="compare the review estimate vs issues resolved in CVAT")
+    stats.add_argument("--task-id", type=int, required=True)
+    stats.set_defaults(func=cmd_stats)
 
     export = sub.add_parser("export", help="download the human-corrected annotations")
     export.add_argument("--task-id", type=int, required=True)

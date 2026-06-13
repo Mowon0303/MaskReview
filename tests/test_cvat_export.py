@@ -123,6 +123,15 @@ class InteractionReportTest(unittest.TestCase):
         self.assertEqual(report["estimated_interactions"], 2)
         self.assertEqual(report["resolved_issues"], 3)
         self.assertEqual(report["delta_vs_estimate"], 1)
+        self.assertNotIn("issues_created", report)  # omitted unless provided
+
+    def test_review_coverage_when_issues_created_given(self) -> None:
+        queue = [{"frame_index": 1, "estimated_interactions": 1}]
+        report = interaction_report(queue, resolved_issue_count=1, issues_created=4)
+        self.assertEqual(report["issues_created"], 4)
+        self.assertEqual(report["review_coverage"], 0.25)  # 1 of 4 resolved
+        # zero issues -> coverage is None, not a divide-by-zero
+        self.assertIsNone(interaction_report(queue, 0, issues_created=0)["review_coverage"])
 
 
 if __name__ == "__main__":
