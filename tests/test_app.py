@@ -8,13 +8,16 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from app import (
+    REASON_STYLES,
     apply_box_click,
     apply_point_click,
+    infer_recommended_correction,
     load_review_frame,
     make_review_frame_choices,
     on_frame_click,
     on_queue_click,
     render_staged_frame,
+    risk_color,
     save_selected_correction,
     select_review_frame,
 )
@@ -136,6 +139,19 @@ class AppHelperTest(unittest.TestCase):
             # switching frames must reset staged clicks so they don't leak into the next correction
             self.assertEqual(points, "")
             self.assertEqual(box, "")
+
+    def test_risk_color_low_priority_band_is_green(self) -> None:
+        # damped occlusion (0.3) and collapsed absence (0.15) get the low-priority green
+        self.assertEqual(risk_color(0.3), "#3ddc97")
+        self.assertEqual(risk_color(0.15), "#3ddc97")
+        # normal/elevated risks keep their warmer colors
+        self.assertNotEqual(risk_color(0.62), "#3ddc97")
+        self.assertEqual(risk_color(0.85), "#ff4d5e")
+
+    def test_oversized_reason_has_style_and_recommends_tight_box(self) -> None:
+        self.assertIn("mask_oversized", REASON_STYLES)
+        rec = infer_recommended_correction({"reasons": ["mask_oversized"]})
+        self.assertEqual(rec, "tight box")  # re-anchor a sprawled blob with a box
 
     def test_render_staged_frame_returns_path_when_nothing_staged(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -29,12 +29,14 @@ class Sam2VideoSegmenter:
         frame_dir: Path,
         init_box_xyxy: tuple[int, int, int, int],
         frame_count: int,
+        init_frame_index: int = 0,
     ) -> dict[int, np.ndarray]:
         return self.segment_with_corrections(
             frame_dir=frame_dir,
             init_box_xyxy=init_box_xyxy,
             frame_count=frame_count,
             corrections=[],
+            init_frame_index=init_frame_index,
         )
 
     def segment_with_corrections(
@@ -43,30 +45,37 @@ class Sam2VideoSegmenter:
         init_box_xyxy: tuple[int, int, int, int],
         frame_count: int,
         corrections: list[dict[str, Any]],
+        init_frame_index: int = 0,
     ) -> dict[int, np.ndarray]:
         torch = self._import_torch()
         predictor = self._load_predictor()
         box = np.array(init_box_xyxy, dtype=np.float32)
+        seed = int(init_frame_index)
+        if seed < 0 or seed >= max(int(frame_count), 1):
+            raise ValueError(
+                f"init_frame_index {seed} is out of range for {frame_count} frames."
+            )
 
+        masks: dict[int, np.ndarray] = {}
+        confidences: dict[int, float] = {}
         with torch.inference_mode(), self._autocast_context(torch):
             state = self._init_state(predictor, frame_dir)
-            self._add_box_prompt(predictor, state, frame_idx=0, box=box)
+            self._add_box_prompt(predictor, state, frame_idx=seed, box=box)
             for correction in sorted(corrections, key=lambda item: int(item["frame_index"])):
                 self._add_correction_prompt(predictor, state, correction)
 
-            masks: dict[int, np.ndarray] = {}
-            confidences: dict[int, float] = {}
-            for output in predictor.propagate_in_video(
-                state,
-                start_frame_idx=0,
-                max_frame_num_to_track=frame_count,
-                reverse=False,
-            ):
-                frame_idx, obj_ids, mask_logits = output[:3]
-                mask, confidence = self._select_object_mask(obj_ids, mask_logits)
-                if mask is not None:
-                    masks[int(frame_idx)] = mask
-                    confidences[int(frame_idx)] = confidence
+            # Propagate forward from the seed frame to the end, then (when the object is
+            # seeded mid-video) backward from the seed to frame 0, so a target first prompted
+            # partway through the clip is tracked in both directions.
+            self._collect_propagation(
+                predictor, state, masks, confidences,
+                start_frame_idx=seed, max_frames=frame_count, reverse=False,
+            )
+            if seed > 0:
+                self._collect_propagation(
+                    predictor, state, masks, confidences,
+                    start_frame_idx=seed, max_frames=seed + 1, reverse=True,
+                )
 
         self.last_confidences = confidences
         if not masks:
@@ -76,6 +85,28 @@ class Sam2VideoSegmenter:
             missing_preview = ", ".join(str(idx) for idx in missing[:10])
             raise RuntimeError(f"SAM2 did not return masks for frames: {missing_preview}")
         return masks
+
+    def _collect_propagation(
+        self,
+        predictor,
+        state,
+        masks: dict[int, np.ndarray],
+        confidences: dict[int, float],
+        start_frame_idx: int,
+        max_frames: int,
+        reverse: bool,
+    ) -> None:
+        for output in predictor.propagate_in_video(
+            state,
+            start_frame_idx=start_frame_idx,
+            max_frame_num_to_track=max_frames,
+            reverse=reverse,
+        ):
+            frame_idx, obj_ids, mask_logits = output[:3]
+            mask, confidence = self._select_object_mask(obj_ids, mask_logits)
+            if mask is not None:
+                masks[int(frame_idx)] = mask
+                confidences[int(frame_idx)] = confidence
 
     def _load_predictor(self):
         if self._predictor is not None:

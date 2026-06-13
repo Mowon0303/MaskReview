@@ -27,7 +27,8 @@ from video_io import VideoMetadata
 
 
 class FakeSegmenter:
-    def segment(self, frame_dir: Path, init_box_xyxy, frame_count: int):
+    def segment(self, frame_dir: Path, init_box_xyxy, frame_count: int, init_frame_index: int = 0):
+        self.last_init_frame_index = init_frame_index
         return {
             0: np.ones((4, 6), dtype=np.uint8),
             1: np.ones((4, 6), dtype=np.uint8),
@@ -39,8 +40,11 @@ class FakeCorrectionSegmenter(FakeSegmenter):
     def __init__(self) -> None:
         self.last_corrections = []
 
-    def segment_with_corrections(self, frame_dir: Path, init_box_xyxy, frame_count: int, corrections):
+    def segment_with_corrections(
+        self, frame_dir: Path, init_box_xyxy, frame_count: int, corrections, init_frame_index: int = 0
+    ):
         self.last_corrections = corrections
+        self.last_init_frame_index = init_frame_index
         return {
             0: np.ones((4, 6), dtype=np.uint8),
             1: np.ones((4, 6), dtype=np.uint8),
@@ -118,6 +122,49 @@ class PipelineTest(unittest.TestCase):
         # without confidences the behaviour is unchanged (geometric only)
         self.assertEqual(build_review_queue([100, 100, 100, 100]), [])
 
+    def test_build_review_queue_flags_oversized_sprawled_blob(self) -> None:
+        # frames 0-3: a small compact object; frame 4: a sprawled blob (two full-width
+        # bands) that is large, far above the typical size, and only ~40% bbox fill.
+        masks = {}
+        for i in range(4):
+            m = np.zeros((100, 100), dtype=np.uint8)
+            m[45:55, 45:55] = 1  # 100 px, centered, off the edges
+            masks[i] = m
+        blob = np.zeros((100, 100), dtype=np.uint8)
+        blob[0:20, :] = 1
+        blob[80:100, :] = 1  # 4000 px, bbox spans the whole frame -> fill 0.40
+        masks[4] = blob
+        areas = [int(masks[i].sum()) for i in range(5)]
+
+        queue = build_review_queue(areas, masks=masks)
+        by_frame = {item["frame_index"]: item for item in queue}
+
+        self.assertIn(4, by_frame)
+        self.assertIn("mask_oversized", by_frame[4]["reasons"])
+        diag = by_frame[4]["diagnostics"]
+        self.assertAlmostEqual(diag["fill_ratio"], 0.40, places=2)
+        self.assertGreaterEqual(diag["frame_fraction"], 0.15)
+        # the small-object frames are never flagged oversized
+        self.assertNotIn(0, by_frame)
+
+    def test_build_review_queue_spares_solid_large_object(self) -> None:
+        # frame 4 is large (64% of frame) and far above the typical size, but SOLID
+        # (fill 1.0) -- a legitimately large object (e.g. a close-up car), not over-seg.
+        masks = {}
+        for i in range(4):
+            m = np.zeros((100, 100), dtype=np.uint8)
+            m[45:55, 45:55] = 1
+            masks[i] = m
+        solid = np.zeros((100, 100), dtype=np.uint8)
+        solid[10:90, 10:90] = 1  # 6400 px, fully fills its bbox
+        masks[4] = solid
+        areas = [int(masks[i].sum()) for i in range(5)]
+
+        by_frame = {item["frame_index"]: item for item in build_review_queue(areas, masks=masks)}
+        # it may trip area_spiked, but the fill gate keeps it out of mask_oversized
+        if 4 in by_frame:
+            self.assertNotIn("mask_oversized", by_frame[4]["reasons"])
+
     def test_review_queue_annotates_confidence_for_triage(self) -> None:
         # geometric drop flags frame 2; its (high) confidence is attached for triage
         queue = build_review_queue(
@@ -166,6 +213,26 @@ class PipelineTest(unittest.TestCase):
         by_frame = {it["frame_index"]: it for it in build_review_queue(areas, confidences=conf)}
         self.assertEqual(by_frame[3]["review_score"], 0.15)
         self.assertGreater(by_frame[2]["review_score"], 0.5)
+
+    def test_confident_smooth_shrink_is_damped_not_hidden(self) -> None:
+        # a smooth decline while SAM2 stays highly confident = likely partial occlusion /
+        # receding object: ranked low, but still present in the queue (never hidden).
+        high = build_review_queue(
+            [100, 80, 60], area_decline_ratio=0.35, confidences={0: 0.99, 1: 0.95, 2: 0.92}
+        )
+        by = {it["frame_index"]: it for it in high}
+        self.assertIn(2, by)  # still queued — not suppressed
+        self.assertEqual(by[2]["reasons"], ["mask_area_trending_down"])
+        self.assertEqual(by[2]["review_score"], 0.3)
+        self.assertEqual(by[2]["status"], "likely_occlusion")
+        self.assertEqual(by[2]["estimated_interactions"], 1)  # cost still counted, not zeroed
+        # the same decline at medium confidence (below the damp floor) keeps its normal rank
+        med = build_review_queue(
+            [100, 80, 60], area_decline_ratio=0.35, confidences={0: 0.7, 1: 0.7, 2: 0.7}
+        )
+        by_med = {it["frame_index"]: it for it in med}
+        self.assertGreater(by_med[2]["review_score"], 0.5)
+        self.assertNotEqual(by_med[2].get("status"), "likely_occlusion")
 
     def test_compute_mask_iou(self) -> None:
         first = np.zeros((4, 4), dtype=np.uint8)
@@ -231,6 +298,42 @@ class PipelineTest(unittest.TestCase):
 
             review_queue = json.loads(result.review_queue_path.read_text(encoding="utf-8"))
             self.assertEqual(review_queue[0]["mask_path"], str(result.mask_dir / "000002.png"))
+
+    def test_pipeline_threads_init_frame_index_to_segmenter(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            video_path = root / "sample.mp4"
+            video_path.write_bytes(b"fake")
+
+            def fake_extract(video_path_arg: Path, frame_dir: Path):
+                frame_dir.mkdir(parents=True, exist_ok=True)
+                return VideoMetadata(fps=5.0, width=6, height=4, frame_count=3)
+
+            def fake_save_mask(mask: np.ndarray, output_path: Path) -> None:
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                output_path.write_bytes(b"x")
+
+            def fake_render_overlay(**kwargs):
+                kwargs["output_path"].write_bytes(b"mp4")
+                return kwargs["output_path"]
+
+            segmenter = FakeSegmenter()
+            with patch.object(pipeline, "extract_video_frames", side_effect=fake_extract), patch.object(
+                pipeline, "save_mask", side_effect=fake_save_mask
+            ), patch.object(pipeline, "render_overlay_video", side_effect=fake_render_overlay):
+                result = PromptableVideoSegmentationPipeline(segmenter).run(
+                    VideoSegmentationRequest(
+                        video_path=video_path,
+                        init_box_xyxy=(0, 0, 5, 3),
+                        init_frame_index=1,  # seed mid-clip
+                        output_dir=root / "outputs",
+                        run_id="seed-test",
+                    )
+                )
+
+            self.assertEqual(segmenter.last_init_frame_index, 1)
+            metrics = json.loads(result.metrics_path.read_text(encoding="utf-8"))
+            self.assertEqual(metrics["init_frame_index"], 1)
 
     def test_pipeline_records_sam2_confidence(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

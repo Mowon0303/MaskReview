@@ -504,6 +504,7 @@ REASON_STYLES = {
     "mask_touches_frame_edge": ("EDGE", "#7aa2ff"),
     "mask_iou_dropped": ("IoU-", "#c08bff"),
     "low_mask_confidence": ("CONF-", "#ff5ea8"),
+    "mask_oversized": ("OVERSIZE", "#ff8c42"),
 }
 
 REASON_RISK = {
@@ -511,6 +512,7 @@ REASON_RISK = {
     "empty_mask": 0.92,
     "low_mask_confidence": 0.88,
     "mask_center_jumped": 0.84,
+    "mask_oversized": 0.80,
     "mask_iou_dropped": 0.78,
     "mask_area_spiked": 0.72,
     "mask_touches_frame_edge": 0.68,
@@ -563,12 +565,16 @@ def risk_color(risk: float) -> str:
         return "#ff4d5e"
     if risk >= 0.65:
         return "#ffb02e"
-    return "#ffd24d"
+    if risk >= 0.4:
+        return "#ffd24d"
+    # low priority (green): collapsed absence frames and confidence-damped likely-occlusion
+    # shrinks — kept in the queue but de-emphasized so real problems read first.
+    return "#3ddc97"
 
 
 def infer_recommended_correction(item: dict[str, Any]) -> str:
     reasons = set(reason_list(item))
-    if reasons & {"mask_center_jumped"}:
+    if reasons & {"mask_center_jumped", "mask_oversized"}:
         return "tight box"
     if reasons & {"mask_area_spiked", "mask_touches_frame_edge"}:
         return "negative point"
@@ -769,6 +775,7 @@ def make_run_state(result, request: VideoSegmentationRequest) -> dict[str, Any]:
         "run_dir": str(result.run_dir),
         "video_path": str(request.video_path),
         "init_box_xyxy": list(request.init_box_xyxy or ()),
+        "init_frame_index": int(request.init_frame_index),
         "sam2_model_cfg": request.sam2_model_cfg,
         "sam2_checkpoint": str(request.sam2_checkpoint),
         "device": request.device,
@@ -968,6 +975,7 @@ def build_correction_runner(pipeline: PromptableVideoSegmentationPipeline):
             run_dir=Path(run_state["run_dir"]),
             video_path=Path(run_state["video_path"]),
             init_box_xyxy=tuple(int(value) for value in run_state["init_box_xyxy"]),
+            init_frame_index=int(run_state.get("init_frame_index", 0)),
             sam2_model_cfg=str(run_state["sam2_model_cfg"]),
             sam2_checkpoint=Path(run_state["sam2_checkpoint"]),
             device=str(run_state["device"]),
@@ -995,13 +1003,18 @@ def build_runner(
     device: str,
     vos_optimized: bool,
 ):
-    def run_demo(video: Any, box_xyxy: str):
+    def run_demo(video: Any, box_xyxy: str, seed_frame: Any = 0):
         video_path = normalize_gradio_video_path(video)
         init_box = parse_box_xyxy(box_xyxy)
+        try:
+            init_frame_index = max(0, int(float(seed_frame))) if seed_frame not in (None, "") else 0
+        except (TypeError, ValueError):
+            init_frame_index = 0
 
         request = VideoSegmentationRequest(
             video_path=Path(video_path),
             init_box_xyxy=init_box,
+            init_frame_index=init_frame_index,
             output_dir=output_dir,
             sam2_model_cfg=sam2_model_cfg,
             sam2_checkpoint=sam2_checkpoint,
@@ -1084,6 +1097,12 @@ def build_demo(args: argparse.Namespace):
                             label="Initial object box · x1,y1,x2,y2",
                             placeholder="80,120,260,420",
                         )
+                        seed_frame = gr.Number(
+                            label="Seed frame (0 = first; set higher to seed a mid-video object — propagates both ways)",
+                            value=0,
+                            precision=0,
+                            minimum=0,
+                        )
                         run_button = gr.Button("Run review pass", variant="primary")
                         gr.HTML('<div class="mr-panel-title"><span>Review queue</span><span class="chip">pending</span></div>')
                         review_queue = gr.HTML(render_review_queue_html([]))
@@ -1165,7 +1184,7 @@ def build_demo(args: argparse.Namespace):
 
         run_button.click(
             run_demo,
-            inputs=[video, box_xyxy],
+            inputs=[video, box_xyxy, seed_frame],
             outputs=[
                 topbar,
                 kpi_strip,

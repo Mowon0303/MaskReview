@@ -26,14 +26,16 @@ from video_io import VideoMetadata
 
 
 class FakeEvalSegmenter:
-    def segment(self, frame_dir: Path, init_box_xyxy, frame_count: int):
+    def segment(self, frame_dir: Path, init_box_xyxy, frame_count: int, init_frame_index: int = 0):
         return {
             0: np.ones((4, 6), dtype=np.uint8),
             1: np.ones((4, 6), dtype=np.uint8),
             2: np.zeros((4, 6), dtype=np.uint8),
         }
 
-    def segment_with_corrections(self, frame_dir: Path, init_box_xyxy, frame_count: int, corrections):
+    def segment_with_corrections(
+        self, frame_dir: Path, init_box_xyxy, frame_count: int, corrections, init_frame_index: int = 0
+    ):
         return {
             0: np.ones((4, 6), dtype=np.uint8),
             1: np.ones((4, 6), dtype=np.uint8),

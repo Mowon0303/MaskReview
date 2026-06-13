@@ -39,6 +39,16 @@ class ReviewPolicy:
     # instead of charging one correction per frame. Keeps the frames visible in the
     # queue but stops disappearance from inflating the interaction estimate.
     collapse_low_confidence_runs: bool = True
+    # Flag a sustained over-segmented blob (mask_oversized): the geometric signals catch
+    # shrinking/empty masks but not a mask that balloons and *stays* large, so an
+    # over-segmentation can silently leave the queue and look like a win. A frame is flagged
+    # when its mask is (a) at least `oversized_area_ratio` of the frame, (b) at least
+    # `oversized_baseline_multiple`x the sequence's typical (20th-pct) object area, AND
+    # (c) sprawled/holey (bbox fill <= `oversized_max_fill_ratio`) rather than a solid large
+    # object — the three together spare a legitimately large, compact object (e.g. a close-up car).
+    oversized_area_ratio: float = 0.15
+    oversized_baseline_multiple: float = 4.0
+    oversized_max_fill_ratio: float = 0.55
 
     def to_dict(self) -> dict[str, float | int]:
         return {
@@ -49,6 +59,9 @@ class ReviewPolicy:
             "area_decline_ratio": self.area_decline_ratio,
             "low_confidence_threshold": self.low_confidence_threshold,
             "collapse_low_confidence_runs": self.collapse_low_confidence_runs,
+            "oversized_area_ratio": self.oversized_area_ratio,
+            "oversized_baseline_multiple": self.oversized_baseline_multiple,
+            "oversized_max_fill_ratio": self.oversized_max_fill_ratio,
         }
 
 
@@ -57,6 +70,9 @@ class VideoSegmentationRequest:
     video_path: Path
     text_prompt: Optional[str] = None
     init_box_xyxy: Optional[tuple[int, int, int, int]] = None
+    # Frame where the init box is applied (0 = first frame). Seed mid-video to track an
+    # object that only appears later; propagation runs forward and backward from this frame.
+    init_frame_index: int = 0
     output_dir: Path = Path("outputs")
     run_id: Optional[str] = None
     sam2_model_cfg: str = DEFAULT_SAM2_MODEL_CFG
@@ -86,6 +102,7 @@ class CorrectionPropagationRequest:
     run_dir: Path
     video_path: Path
     init_box_xyxy: tuple[int, int, int, int]
+    init_frame_index: int = 0
     sam2_model_cfg: str = DEFAULT_SAM2_MODEL_CFG
     sam2_checkpoint: Path = DEFAULT_SAM2_CHECKPOINT
     device: str = "cuda"
@@ -170,6 +187,7 @@ class PromptableVideoSegmentationPipeline:
             frame_dir=frame_dir,
             init_box_xyxy=request.init_box_xyxy,
             frame_count=metadata.frame_count,
+            init_frame_index=request.init_frame_index,
         )
         confidences = getattr(segmenter, "last_confidences", None) or None
 
@@ -194,6 +212,9 @@ class PromptableVideoSegmentationPipeline:
             confidences=confidences,
             low_confidence_threshold=request.review_policy.low_confidence_threshold,
             collapse_low_confidence_runs=request.review_policy.collapse_low_confidence_runs,
+            oversized_area_ratio=request.review_policy.oversized_area_ratio,
+            oversized_baseline_multiple=request.review_policy.oversized_baseline_multiple,
+            oversized_max_fill_ratio=request.review_policy.oversized_max_fill_ratio,
         )
         review_frame_indices = [int(item["frame_index"]) for item in review_queue]
         estimated_min_interactions = sum(int(item["estimated_interactions"]) for item in review_queue)
@@ -220,6 +241,7 @@ class PromptableVideoSegmentationPipeline:
             "width": metadata.width,
             "height": metadata.height,
             "box_xyxy": list(request.init_box_xyxy),
+            "init_frame_index": int(request.init_frame_index),
             "mask_areas": mask_areas,
             "mask_confidences": (
                 [round(float(confidences.get(i, 0.0)), 4) for i in range(metadata.frame_count)]
@@ -296,6 +318,7 @@ class PromptableVideoSegmentationPipeline:
             init_box_xyxy=request.init_box_xyxy,
             frame_count=metadata.frame_count,
             corrections=corrections,
+            init_frame_index=request.init_frame_index,
         )
         confidences = getattr(segmenter, "last_confidences", None) or None
 
@@ -327,6 +350,9 @@ class PromptableVideoSegmentationPipeline:
             confidences=confidences,
             low_confidence_threshold=request.review_policy.low_confidence_threshold,
             collapse_low_confidence_runs=request.review_policy.collapse_low_confidence_runs,
+            oversized_area_ratio=request.review_policy.oversized_area_ratio,
+            oversized_baseline_multiple=request.review_policy.oversized_baseline_multiple,
+            oversized_max_fill_ratio=request.review_policy.oversized_max_fill_ratio,
         )
         review_frame_indices = [int(item["frame_index"]) for item in review_queue]
         actual_interactions = count_correction_interactions(corrections)
@@ -353,6 +379,7 @@ class PromptableVideoSegmentationPipeline:
             "width": metadata.width,
             "height": metadata.height,
             "box_xyxy": list(request.init_box_xyxy),
+            "init_frame_index": int(request.init_frame_index),
             "mask_areas": mask_areas,
             "mask_confidences": (
                 [round(float(confidences.get(i, 0.0)), 4) for i in range(metadata.frame_count)]
@@ -525,6 +552,9 @@ def build_review_queue(
     confidences: Optional[dict[int, float]] = None,
     low_confidence_threshold: float = 0.5,
     collapse_low_confidence_runs: bool = True,
+    oversized_area_ratio: float = 0.15,
+    oversized_baseline_multiple: float = 4.0,
+    oversized_max_fill_ratio: float = 0.55,
 ) -> list[dict[str, object]]:
     """Create the smallest set of frames that need human correction.
 
@@ -643,6 +673,47 @@ def build_review_queue(
                     diagnostics={"edge_margin": edge_margin},
                 )
 
+    # mask_oversized: a sustained over-segmented blob stays large and stops tripping the
+    # shrink/empty/spike signals, so it silently leaves the queue and can look like a win.
+    # Flag frames whose mask is a large fraction of the frame AND far bigger than the
+    # sequence's typical object size AND sprawled/holey (low bbox fill) — all three guard
+    # against flagging a legitimately large, compact object (e.g. an approaching car).
+    if mask_stats:
+        nonzero_areas = [stats["area"] for stats in mask_stats.values() if stats["area"] > 0]
+        if nonzero_areas:
+            baseline = float(np.percentile(nonzero_areas, 20))
+            for idx in sorted(mask_stats):
+                stats = mask_stats[idx]
+                area = float(stats["area"])
+                bbox = stats.get("bbox_xyxy")
+                frame_pixels = float(stats["width"]) * float(stats["height"])
+                if area <= 0 or bbox is None or frame_pixels <= 0:
+                    continue
+                x1, y1, x2, y2 = bbox
+                bbox_area = float((x2 - x1 + 1) * (y2 - y1 + 1))
+                frame_fraction = area / frame_pixels
+                fill_ratio = area / bbox_area if bbox_area > 0 else 1.0
+                if (
+                    frame_fraction >= oversized_area_ratio
+                    and area >= oversized_baseline_multiple * max(baseline, 1.0)
+                    and fill_ratio <= oversized_max_fill_ratio
+                ):
+                    add_review_queue_signal(
+                        review_by_frame,
+                        frame_index=idx,
+                        reason="mask_oversized",
+                        current_area=area,
+                        previous_area=areas[idx - 1] if 0 < idx < len(areas) else None,
+                        area_change_ratio=area / max(baseline, 1.0),
+                        frame_dir=frame_dir,
+                        mask_dir=mask_dir,
+                        diagnostics={
+                            "frame_fraction": round(frame_fraction, 4),
+                            "fill_ratio": round(fill_ratio, 4),
+                            "baseline_area_multiple": round(area / max(baseline, 1.0), 2),
+                        },
+                    )
+
     if confidences is not None:
         for idx in range(len(areas)):
             confidence = float(confidences.get(idx, 0.0))
@@ -679,6 +750,18 @@ def build_review_queue(
                     item["status"] = "low_confidence_empty"
                     item["estimated_interactions"] = 1 if position == 0 else 0
 
+        # Partial-occlusion damping: flag frames whose only signal is a smooth area decline
+        # while SAM2 stays highly confident — likely a correctly-tracked partially occluded
+        # object, not a loss. Kept in the queue (transparency) but ranked low by review_score.
+        for idx, item in review_by_frame.items():
+            reasons = set(item.get("reasons", []) or [item.get("reason")])
+            if (
+                item.get("status") in (None, "needs_review")
+                and reasons <= DAMPABLE_SHRINK_REASONS
+                and float(confidences.get(idx, 0.0)) >= OCCLUSION_DAMP_CONFIDENCE
+            ):
+                item["status"] = "likely_occlusion"
+
     # Unified, rankable review priority per frame (geometric reasons + SAM2 confidence,
     # with collapsed/suppressed frames ranked low). Callers can sort the queue by this.
     for item in review_by_frame.values():
@@ -705,12 +788,22 @@ REVIEW_REASON_WEIGHTS: dict[str, float] = {
     "empty_mask": 0.92,
     "low_mask_confidence": 0.88,
     "mask_center_jumped": 0.84,
+    "mask_oversized": 0.80,
     "mask_iou_dropped": 0.78,
     "mask_area_spiked": 0.72,
     "mask_touches_frame_edge": 0.68,
     "mask_area_dropped": 0.66,
     "mask_area_trending_down": 0.62,
 }
+
+
+# A mask that ONLY trends down smoothly while SAM2 stays this confident is most likely
+# tracking a partially occluded / receding object correctly (segmenting the visible part),
+# not losing it. Such a frame is ranked low (but kept in the queue — never hidden — so a
+# confidently-wrong mask is still reviewable). Sudden drops/other signals are NOT damped.
+DAMPABLE_SHRINK_REASONS: frozenset[str] = frozenset({"mask_area_trending_down"})
+OCCLUSION_DAMP_CONFIDENCE: float = 0.85
+OCCLUSION_DAMP_SCORE: float = 0.3
 
 
 def compute_review_score(item: dict[str, object]) -> float:
@@ -720,10 +813,18 @@ def compute_review_score(item: dict[str, object]) -> float:
     otherwise the score is the strongest reason weight, nudged up when several signals
     corroborate. SAM2 confidence enters via the `low_mask_confidence` reason weight and
     the collapse, so a high-confidence geometric false positive ranks below a real loss.
+    A smooth shrink with high SAM2 confidence (likely partial occlusion) is damped low.
     """
     if int(item.get("estimated_interactions", 1)) == 0:
         return 0.15
     reasons = list(item.get("reasons", []) or [item.get("reason")])
+    confidence = (item.get("diagnostics") or {}).get("confidence")
+    if (
+        confidence is not None
+        and set(reasons) <= DAMPABLE_SHRINK_REASONS
+        and float(confidence) >= OCCLUSION_DAMP_CONFIDENCE
+    ):
+        return OCCLUSION_DAMP_SCORE
     base = max((REVIEW_REASON_WEIGHTS.get(reason, 0.55) for reason in reasons), default=0.55)
     return round(min(0.99, base + 0.04 * (len(reasons) - 1)), 4)
 
