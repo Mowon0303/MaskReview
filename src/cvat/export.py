@@ -194,7 +194,7 @@ def _issue_message(item: dict[str, Any]) -> str:
     prefix = f"[{float(score):.2f}] " if isinstance(score, (int, float)) else ""
     body = ", ".join(reasons) if reasons else "needs_review"
     fix = item.get("recommended_correction")
-    suffix = f" — fix: {fix}" if fix else ""
+    suffix = f" | fix: {fix}" if fix else ""  # ASCII separator: issue text crosses systems
     return f"{prefix}{body}{suffix}"
 
 
