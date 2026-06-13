@@ -5,3 +5,4 @@ Pillow
 matplotlib
 tqdm
 git+https://github.com/facebookresearch/sam2.git
+cvat-sdk  # only needed for the CVAT plugin (src/cvat/client.py, scripts/cvat_sync.py)
