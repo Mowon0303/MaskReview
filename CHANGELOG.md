@@ -6,6 +6,8 @@ All notable changes to this project are documented here.
 
 ### Added
 
+- Added `docs/cvat_plugin.md`: P8 design doc for the CVAT plugin (self-hosted Docker CVAT, cvat-sdk path, offline export layer + thin client, masks→COCO RLE, review_queue→CVAT issues, frame alignment). Code not yet implemented.
+
 - Added `src/quality_metrics.py` with region IoU (J), boundary F-measure (F), and J&F mask-quality scoring against ground-truth masks.
 - Added optional `ground_truth_mask_dir` per eval manifest case; the harness now scores propagation quality (J/F/J&F) before and after corrections.
 - Added `gt_jf_before` / `gt_jf_after` / `gt_jf_delta` (and J/F) columns to `evaluation_results.csv`, a Ground-Truth Quality section to `evaluation_report.md`, and a Mean J&F column to the threshold calibration report.

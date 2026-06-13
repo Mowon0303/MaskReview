@@ -23,7 +23,7 @@
 | P5 | 最少交互修正 | 每个队列帧只做一次点/框 correction | `src/corrections.py`, `corrections.json`, Gradio correction 表单 | Done | 支持正点、负点、tight box 三种 correction，并写入 run artifact | 将保存的 correction 接入重传播 |
 | P6 | 修正后重传播 | 从 correction frame 继续传播并比较前后效果 | `segment_with_corrections()`, `overlay_after.mp4`, `metrics_after.json`, `comparison.json` | Done | correction prompt 接入 SAM2 后能输出 before/after metrics | 继续验证多 correction、多漂移视频和质量指标 |
 | P7 | 实验评估 | 证明队列比固定间隔复核更省交互 | `src/evaluation.py`, `src/quality_metrics.py`, `src/manifest_template.py`, `scripts/run_evaluation.py`, `scripts/generate_eval_manifest_template.py`, `data/eval_manifest.example.json`, `data/eval_first_frames/`, `threshold_calibration_report.md` | Partial | 已能从 manifest 生成 eval CSV/report，支持真实视频模板生成、第一帧导出、`expected_review_frames` 命中率/漏检率统计和 sensitive/default/conservative 阈值校准；首段真实视频 CPU smoke 已完成（见下方「P7 实验记录」），IoU/J&F 评分已实现（`src/quality_metrics.py`，给 manifest case 加 `ground_truth_mask_dir` 即可打分），多视频与真值标注证据未完成 | 准备 10 到 20 段自采视频，补 `init_box_xyxy` 和 `expected_review_frames`，并跑第一版校准 report |
-| P8 | CVAT 插件雏形 | 把本地复核闭环接入真实标注工作流 | 未实现 | Pending | 从 CVAT task 读取、写回 review queue、导出 annotation 和交互统计 | 本地 MVP 稳定后再开插件目录 |
+| P8 | CVAT 插件雏形 | 把本地复核闭环接入真实标注工作流 | `docs/cvat_plugin.md`（设计） | Design | 已出详细设计文档（自托管 Docker CVAT、cvat-sdk 路径、offline export 层 + 薄 client、masks→COCO RLE、review_queue→CVAT issues、帧对齐）；代码未实现 | 下一步先做 `src/cvat/export.py` 离线导出层（纯离线可单测，无需 CVAT 环境） |
 
 ## P7 实验记录
 
