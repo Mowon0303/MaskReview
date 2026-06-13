@@ -97,8 +97,12 @@ def cmd_push(args: argparse.Namespace) -> None:
     queue = _build_queue(masks, pulled.frame_count, getattr(segmenter, "last_confidences", None))
     print(f"SAM2 propagated {pulled.frame_count} frames; {len(queue)} flagged for review")
 
-    bridge.import_masks_coco(args.task_id, masks, label=args.label, frame_names=pulled.frame_names)
-    print(f"imported masks as COCO annotations ({sum((np.asarray(m) > 0).any() for m in masks.values())} non-empty)")
+    if args.via == "shapes":
+        count = bridge.import_masks_native(args.task_id, masks, label=args.label)
+        print(f"imported {count} masks as native CVAT mask shapes (editable)")
+    else:
+        bridge.import_masks_coco(args.task_id, masks, label=args.label, frame_names=pulled.frame_names)
+        print(f"imported masks as COCO annotations ({sum((np.asarray(m) > 0).any() for m in masks.values())} non-empty)")
 
     issues = queue_to_issues(queue, min_score=args.min_score, bboxes=_mask_bboxes(masks))
     created = bridge.create_issues(args.task_id, issues)
@@ -122,6 +126,8 @@ def main() -> None:
     push.add_argument("--label", default="object")
     push.add_argument("--min-score", type=float, default=0.4,
                       help="drop queue frames below this review_score from issues (damped/collapsed).")
+    push.add_argument("--via", choices=["coco", "shapes"], default="coco",
+                      help="how to import masks: coco (dataset import) or shapes (native editable mask shapes).")
     push.add_argument("--frame-dir", default=None, help="where to cache pulled frames.")
     push.add_argument("--device", default="cuda")
     push.add_argument("--sam2-model-cfg", default=DEFAULT_SAM2_MODEL_CFG)

@@ -130,6 +130,37 @@ class CvatBridge:
                 task = client.tasks.retrieve(task_id)
                 task.import_annotations("COCO 1.0", str(zip_path), conv_mask_to_poly=conv_mask_to_poly)
 
+    def import_masks_native(self, task_id: int, masks: dict[int, Any], *, label: str = "object") -> int:
+        """Upload masks as native CVAT mask shapes (path B), keyed by frame index.
+
+        Unlike the COCO path this needs no file_name matching and lands masks the annotator
+        can edit directly in CVAT. REPLACES the task's shape annotations. Returns the count.
+        """
+        from cvat.export import mask_to_cvat_points
+
+        with make_client(self._host, credentials=self._credentials) as client:
+            task = client.tasks.retrieve(task_id)
+            label_id = {str(l.name): int(l.id) for l in task.get_labels()}.get(label)
+            if label_id is None:
+                raise ValueError(f"Task {task_id} has no label named {label!r}.")
+            shapes = []
+            for frame in sorted(masks):
+                points = mask_to_cvat_points(masks[frame])
+                if not points:  # empty mask -> no shape on that frame
+                    continue
+                shapes.append(
+                    models.LabeledShapeRequest(
+                        type="mask",
+                        label_id=label_id,
+                        frame=int(frame),
+                        points=[float(p) for p in points],
+                        occluded=False,
+                        z_order=0,
+                    )
+                )
+            task.set_annotations(models.LabeledDataRequest(shapes=shapes))
+            return len(shapes)
+
     def create_issues(self, task_id: int, issues: list[IssuePayload]) -> int:
         """Raise one CVAT issue per payload on the task's job. Returns the count created."""
         created = 0
