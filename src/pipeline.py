@@ -31,6 +31,14 @@ class ReviewPolicy:
     iou_drop_threshold: float = 0.2
     edge_margin: int = 0
     area_decline_ratio: float = 0.35
+    # Flag frames whose SAM2 confidence (sigmoid of peak object logit) is below this.
+    # Only applied when the segmenter exposes per-frame confidence.
+    low_confidence_threshold: float = 0.5
+    # Collapse a run of consecutive empty + low-confidence frames (a likely object
+    # absence/loss that SAM2 itself is unsure about) into a single onset interaction,
+    # instead of charging one correction per frame. Keeps the frames visible in the
+    # queue but stops disappearance from inflating the interaction estimate.
+    collapse_low_confidence_runs: bool = True
 
     def to_dict(self) -> dict[str, float | int]:
         return {
@@ -39,6 +47,8 @@ class ReviewPolicy:
             "iou_drop_threshold": self.iou_drop_threshold,
             "edge_margin": self.edge_margin,
             "area_decline_ratio": self.area_decline_ratio,
+            "low_confidence_threshold": self.low_confidence_threshold,
+            "collapse_low_confidence_runs": self.collapse_low_confidence_runs,
         }
 
 
@@ -161,6 +171,7 @@ class PromptableVideoSegmentationPipeline:
             init_box_xyxy=request.init_box_xyxy,
             frame_count=metadata.frame_count,
         )
+        confidences = getattr(segmenter, "last_confidences", None) or None
 
         masks: dict[int, np.ndarray] = {}
         mask_areas: list[int] = []
@@ -180,6 +191,9 @@ class PromptableVideoSegmentationPipeline:
             iou_drop_threshold=request.review_policy.iou_drop_threshold,
             edge_margin=request.review_policy.edge_margin,
             area_decline_ratio=request.review_policy.area_decline_ratio,
+            confidences=confidences,
+            low_confidence_threshold=request.review_policy.low_confidence_threshold,
+            collapse_low_confidence_runs=request.review_policy.collapse_low_confidence_runs,
         )
         review_frame_indices = [int(item["frame_index"]) for item in review_queue]
         estimated_min_interactions = sum(int(item["estimated_interactions"]) for item in review_queue)
@@ -207,11 +221,15 @@ class PromptableVideoSegmentationPipeline:
             "height": metadata.height,
             "box_xyxy": list(request.init_box_xyxy),
             "mask_areas": mask_areas,
+            "mask_confidences": (
+                [round(float(confidences.get(i, 0.0)), 4) for i in range(metadata.frame_count)]
+                if confidences else []
+            ),
             "review_frame_indices": review_frame_indices,
             "review_queue_path": str(review_queue_path),
             "review_queue": review_queue,
             "review_reason_counts": count_review_reasons(review_queue),
-            "review_policy": "Queue only low-confidence propagation frames; ask for one point/box correction per queued frame.",
+            "review_policy": "Queue low-confidence propagation frames (geometric drift signals + SAM2 mask confidence); ask for one point/box correction per queued frame.",
             "review_policy_config": request.review_policy.to_dict(),
             "estimated_min_interactions": estimated_min_interactions,
             "video_duration_seconds": round(video_duration_seconds, 3),
@@ -279,6 +297,7 @@ class PromptableVideoSegmentationPipeline:
             frame_count=metadata.frame_count,
             corrections=corrections,
         )
+        confidences = getattr(segmenter, "last_confidences", None) or None
 
         mask_dir = run_dir / "masks_after"
         overlay_path = run_dir / "overlay_after.mp4"
@@ -305,6 +324,9 @@ class PromptableVideoSegmentationPipeline:
             iou_drop_threshold=request.review_policy.iou_drop_threshold,
             edge_margin=request.review_policy.edge_margin,
             area_decline_ratio=request.review_policy.area_decline_ratio,
+            confidences=confidences,
+            low_confidence_threshold=request.review_policy.low_confidence_threshold,
+            collapse_low_confidence_runs=request.review_policy.collapse_low_confidence_runs,
         )
         review_frame_indices = [int(item["frame_index"]) for item in review_queue]
         actual_interactions = count_correction_interactions(corrections)
@@ -332,6 +354,10 @@ class PromptableVideoSegmentationPipeline:
             "height": metadata.height,
             "box_xyxy": list(request.init_box_xyxy),
             "mask_areas": mask_areas,
+            "mask_confidences": (
+                [round(float(confidences.get(i, 0.0)), 4) for i in range(metadata.frame_count)]
+                if confidences else []
+            ),
             "review_frame_indices": review_frame_indices,
             "review_queue_path": str(review_queue_path),
             "review_queue": review_queue,
@@ -420,14 +446,14 @@ def validate_corrections(corrections: list[dict[str, Any]], metadata: VideoMetad
             points = correction.get("points") or []
             if not points:
                 raise ValueError(f"Point correction has no points: {correction}")
-            point = points[0]
-            x = float(point["x"])
-            y = float(point["y"])
-            if x < 0 or y < 0 or x >= metadata.width or y >= metadata.height:
-                raise ValueError(
-                    f"Point correction {(x, y)} is outside frame size "
-                    f"{metadata.width}x{metadata.height}."
-                )
+            for point in points:
+                x = float(point["x"])
+                y = float(point["y"])
+                if x < 0 or y < 0 or x >= metadata.width or y >= metadata.height:
+                    raise ValueError(
+                        f"Point correction {(x, y)} is outside frame size "
+                        f"{metadata.width}x{metadata.height}."
+                    )
         elif correction_type == "tight_box":
             x1, y1, x2, y2 = [int(value) for value in correction["box_xyxy"]]
             validate_box_xyxy((x1, y1, x2, y2), metadata)
@@ -496,11 +522,17 @@ def build_review_queue(
     iou_drop_threshold: float = 0.2,
     edge_margin: int = 0,
     area_decline_ratio: float = 0.35,
+    confidences: Optional[dict[int, float]] = None,
+    low_confidence_threshold: float = 0.5,
+    collapse_low_confidence_runs: bool = True,
 ) -> list[dict[str, object]]:
     """Create the smallest set of frames that need human correction.
 
-    Until SAM2 confidence logits are exposed by the runner, lightweight geometric
-    signals act as low-confidence proxies for propagation drift.
+    Geometric signals (area/center/IoU/edge) act as drift proxies. When the segmenter
+    exposes per-frame SAM2 confidence (``confidences``), frames below
+    ``low_confidence_threshold`` are additionally flagged, and every queued frame is
+    annotated with its ``confidence`` for triage (a flagged frame with high confidence
+    is likely a geometric false positive; low confidence suggests real loss/occlusion).
     """
     areas = [float(area) for area in mask_areas]
     review_by_frame: dict[int, dict[str, object]] = {}
@@ -611,7 +643,89 @@ def build_review_queue(
                     diagnostics={"edge_margin": edge_margin},
                 )
 
+    if confidences is not None:
+        for idx in range(len(areas)):
+            confidence = float(confidences.get(idx, 0.0))
+            if confidence < low_confidence_threshold:
+                add_review_queue_signal(
+                    review_by_frame,
+                    frame_index=idx,
+                    reason="low_mask_confidence",
+                    current_area=areas[idx],
+                    previous_area=areas[idx - 1] if idx > 0 else None,
+                    area_change_ratio=0.0,
+                    frame_dir=frame_dir,
+                    mask_dir=mask_dir,
+                    diagnostics={"confidence": round(confidence, 4)},
+                )
+        # annotate every queued frame with SAM2 confidence so callers can triage
+        for idx, item in review_by_frame.items():
+            diagnostics = dict(item.get("diagnostics", {}))
+            diagnostics.setdefault("confidence", round(float(confidences.get(idx, 0.0)), 4))
+            item["diagnostics"] = diagnostics
+
+        # Collapse a run of consecutive empty + low-confidence frames (a likely object
+        # absence/loss SAM2 is itself unsure about) into a single onset interaction:
+        # the human makes one decision ("object left / re-point here"), not one per frame.
+        if collapse_low_confidence_runs:
+            absent = [
+                idx
+                for idx in sorted(review_by_frame)
+                if areas[idx] == 0 and float(confidences.get(idx, 1.0)) < low_confidence_threshold
+            ]
+            for run in _consecutive_runs(absent):
+                for position, idx in enumerate(run):
+                    item = review_by_frame[idx]
+                    item["status"] = "low_confidence_empty"
+                    item["estimated_interactions"] = 1 if position == 0 else 0
+
+    # Unified, rankable review priority per frame (geometric reasons + SAM2 confidence,
+    # with collapsed/suppressed frames ranked low). Callers can sort the queue by this.
+    for item in review_by_frame.values():
+        item["review_score"] = compute_review_score(item)
+
     return [review_by_frame[idx] for idx in sorted(review_by_frame)]
+
+
+def _consecutive_runs(indices: list[int]) -> list[list[int]]:
+    """Group sorted frame indices into runs of consecutive integers."""
+    runs: list[list[int]] = []
+    for idx in indices:
+        if runs and idx == runs[-1][-1] + 1:
+            runs[-1].append(idx)
+        else:
+            runs.append([idx])
+    return runs
+
+
+# Per-reason base risk weights — the single source of truth for review priority.
+# (The Gradio UI reads each item's `review_score` instead of re-deriving its own.)
+REVIEW_REASON_WEIGHTS: dict[str, float] = {
+    "empty_initial_mask": 0.95,
+    "empty_mask": 0.92,
+    "low_mask_confidence": 0.88,
+    "mask_center_jumped": 0.84,
+    "mask_iou_dropped": 0.78,
+    "mask_area_spiked": 0.72,
+    "mask_touches_frame_edge": 0.68,
+    "mask_area_dropped": 0.66,
+    "mask_area_trending_down": 0.62,
+}
+
+
+def compute_review_score(item: dict[str, object]) -> float:
+    """Combine an item's reasons (and collapse state) into a 0–1 review priority.
+
+    Frames suppressed by absence-run collapse (estimated_interactions == 0) rank low;
+    otherwise the score is the strongest reason weight, nudged up when several signals
+    corroborate. SAM2 confidence enters via the `low_mask_confidence` reason weight and
+    the collapse, so a high-confidence geometric false positive ranks below a real loss.
+    """
+    if int(item.get("estimated_interactions", 1)) == 0:
+        return 0.15
+    reasons = list(item.get("reasons", []) or [item.get("reason")])
+    base = max((REVIEW_REASON_WEIGHTS.get(reason, 0.55) for reason in reasons), default=0.55)
+    return round(min(0.99, base + 0.04 * (len(reasons) - 1)), 4)
 
 
 def add_review_queue_signal(

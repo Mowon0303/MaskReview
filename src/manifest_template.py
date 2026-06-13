@@ -59,6 +59,7 @@ def generate_eval_manifest_template(
             "Set expected_challenge to clean_tracking, occlusion, target_loss, similar_object, scale_change, or camera_motion.",
             "Optionally fill expected_review_frames after manual inspection to score queue precision/recall.",
             "Optional corrections can be added after reviewing baseline output.",
+            "Optionally set ground_truth_mask_dir to a folder of 000000.png masks to score IoU/J&F before and after corrections.",
         ],
         "cases": cases,
     }
@@ -95,6 +96,7 @@ def build_manifest_case(
         "expected_review_frames": None,
         "notes": "",
         "first_frame_path": make_relative_path(first_frame_path, manifest_dir),
+        "ground_truth_mask_dir": None,
         "video_metadata": metadata.to_dict(),
         "corrections": [],
     }

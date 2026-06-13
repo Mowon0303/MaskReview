@@ -21,6 +21,8 @@ class Sam2VideoSegmenter:
     def __post_init__(self) -> None:
         self.checkpoint_path = Path(self.checkpoint_path)
         self._predictor = None
+        # Per-frame SAM2 confidence (sigmoid of the peak object logit), filled after segment().
+        self.last_confidences: dict[int, float] = {}
 
     def segment(
         self,
@@ -53,6 +55,7 @@ class Sam2VideoSegmenter:
                 self._add_correction_prompt(predictor, state, correction)
 
             masks: dict[int, np.ndarray] = {}
+            confidences: dict[int, float] = {}
             for output in predictor.propagate_in_video(
                 state,
                 start_frame_idx=0,
@@ -60,10 +63,12 @@ class Sam2VideoSegmenter:
                 reverse=False,
             ):
                 frame_idx, obj_ids, mask_logits = output[:3]
-                mask = self._select_object_mask(obj_ids, mask_logits)
+                mask, confidence = self._select_object_mask(obj_ids, mask_logits)
                 if mask is not None:
                     masks[int(frame_idx)] = mask
+                    confidences[int(frame_idx)] = confidence
 
+        self.last_confidences = confidences
         if not masks:
             raise RuntimeError("SAM2 did not return any propagated masks.")
         missing = sorted(set(range(frame_count)) - set(masks))
@@ -128,23 +133,30 @@ class Sam2VideoSegmenter:
         except TypeError:
             predictor.add_new_points_or_box(state, frame_idx, self.obj_id, box=box)
 
-    def _add_point_prompt(
+    def _add_points_prompt(
         self,
         predictor,
         state,
         frame_idx: int,
-        point_xy: tuple[float, float],
-        label: int,
+        points: list[dict[str, Any]],
+        default_label: int = 1,
         clear_old_points: bool = True,
     ) -> None:
-        points = np.array([point_xy], dtype=np.float32)
-        labels = np.array([label], dtype=np.int32)
+        coords = np.array([[float(p["x"]), float(p["y"])] for p in points], dtype=np.float32)
+        labels = np.array(
+            [
+                1 if str(p.get("label", "")).lower().startswith("pos")
+                else (0 if "label" in p else default_label)
+                for p in points
+            ],
+            dtype=np.int32,
+        )
         try:
             predictor.add_new_points_or_box(
                 inference_state=state,
                 frame_idx=frame_idx,
                 obj_id=self.obj_id,
-                points=points,
+                points=coords,
                 labels=labels,
                 clear_old_points=clear_old_points,
             )
@@ -153,7 +165,7 @@ class Sam2VideoSegmenter:
                 state,
                 frame_idx,
                 self.obj_id,
-                points=points,
+                points=coords,
                 labels=labels,
                 clear_old_points=clear_old_points,
             )
@@ -174,31 +186,40 @@ class Sam2VideoSegmenter:
             points = correction.get("points") or []
             if not points:
                 raise ValueError(f"Point correction has no points: {correction}")
-            point = points[0]
-            label = 1 if correction_type == "positive_point" else 0
-            self._add_point_prompt(
+            default_label = 1 if correction_type == "positive_point" else 0
+            self._add_points_prompt(
                 predictor,
                 state,
                 frame_idx=frame_idx,
-                point_xy=(float(point["x"]), float(point["y"])),
-                label=label,
+                points=points,
+                default_label=default_label,
                 clear_old_points=frame_idx != 0,
             )
             return
 
         raise ValueError(f"Unsupported correction type: {correction_type}")
 
-    def _select_object_mask(self, obj_ids, mask_logits) -> np.ndarray | None:
+    def _select_object_mask(self, obj_ids, mask_logits) -> tuple[np.ndarray | None, float]:
+        """Return (binary mask, confidence) for this object.
+
+        Confidence is the sigmoid of the peak object logit — a SAM2-grounded proxy for
+        "how strongly the model believes the object is present this frame" (~1.0 when the
+        object is confidently tracked, <0.5 when the predicted foreground is all negative,
+        i.e. the object is likely lost/occluded). Returns (None, 0.0) if the object is
+        absent from this frame's outputs.
+        """
         obj_id_list = [int(obj_id) for obj_id in obj_ids]
         if self.obj_id not in obj_id_list:
-            return None
+            return None, 0.0
 
         obj_index = obj_id_list.index(self.obj_id)
         selected = mask_logits[obj_index]
         if hasattr(selected, "detach"):
             selected = selected.detach().cpu().numpy()
         selected = np.squeeze(np.asarray(selected))
-        return (selected > 0.0).astype(np.uint8)
+        peak = float(selected.max()) if selected.size else float("-inf")
+        confidence = 1.0 / (1.0 + np.exp(-float(np.clip(peak, -30.0, 30.0))))
+        return (selected > 0.0).astype(np.uint8), float(confidence)
 
     def _import_torch(self):
         try:

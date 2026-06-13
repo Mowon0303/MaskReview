@@ -68,9 +68,11 @@ def build_correction(
             correction["mask_path"] = review_item["mask_path"]
 
     if correction_type in POINT_CORRECTION_TYPES:
-        x, y = parse_point_xy(point_xy)
+        points = parse_points_xy(point_xy)
         label = "positive" if correction_type == "positive_point" else "negative"
-        correction["points"] = [{"x": x, "y": y, "label": label}]
+        correction["points"] = [{"x": x, "y": y, "label": label} for x, y in points]
+        # one human interaction per click — a hard frame may need several points
+        correction["estimated_interactions"] = len(points)
     else:
         correction["box_xyxy"] = list(parse_box_xyxy(box_xyxy))
 
@@ -89,6 +91,14 @@ def parse_point_xy(raw_point: str) -> tuple[int, int]:
     if x < 0 or y < 0:
         raise ValueError("Point coordinates must be non-negative.")
     return x, y
+
+
+def parse_points_xy(raw_points: str) -> list[tuple[int, int]]:
+    """Parse one or more points: 'x,y' or 'x1,y1;x2,y2;...' (one click each)."""
+    chunks = [chunk for chunk in raw_points.split(";") if chunk.strip()]
+    if not chunks:
+        raise ValueError("At least one point is required, formatted as x,y or x1,y1;x2,y2.")
+    return [parse_point_xy(chunk) for chunk in chunks]
 
 
 def parse_box_xyxy(raw_box: str) -> tuple[int, int, int, int]:

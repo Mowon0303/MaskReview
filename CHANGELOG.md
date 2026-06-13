@@ -2,6 +2,30 @@
 
 All notable changes to this project are documented here.
 
+## [Unreleased]
+
+### Added
+
+- Added `src/quality_metrics.py` with region IoU (J), boundary F-measure (F), and J&F mask-quality scoring against ground-truth masks.
+- Added optional `ground_truth_mask_dir` per eval manifest case; the harness now scores propagation quality (J/F/J&F) before and after corrections.
+- Added `gt_jf_before` / `gt_jf_after` / `gt_jf_delta` (and J/F) columns to `evaluation_results.csv`, a Ground-Truth Quality section to `evaluation_report.md`, and a Mean J&F column to the threshold calibration report.
+- Added a `ground_truth_mask_dir` placeholder to generated eval manifest templates.
+- Added unit tests for region IoU, boundary F, sequence J&F aggregation, indexed mask IO, and ground-truth-scored evaluation.
+- Added a **SAM2 mask-confidence signal** to the review queue: `Sam2VideoSegmenter` now exposes per-frame confidence (sigmoid of the peak object logit) via `last_confidences`; the pipeline records `mask_confidences` in metrics, adds a `low_mask_confidence` review reason, annotates every queued frame with its `confidence` for triage, and exposes `ReviewPolicy.low_confidence_threshold`. The UI styles the new `CONF-` reason. Backward compatible — segmenters without confidence fall back to geometric-only.
+- Added confidence-based **collapse of object-absence runs**: consecutive empty + low-confidence frames are marked `status: low_confidence_empty` and charged a single onset interaction instead of one per frame (`ReviewPolicy.collapse_low_confidence_runs`, default on). Frames stay visible in the queue, but a disappearance no longer inflates the interaction estimate (verified 54 → 5 on a MOSE disappear/reappear clip).
+- Added a unified per-frame `review_score` (0–1) on every queue item, combining geometric reason weights with confidence/collapse state (`pipeline.REVIEW_REASON_WEIGHTS` is the single source of truth); the Gradio UI now reads `review_score` instead of re-deriving its own risk. Verified on real MOSE data: real-drift frames rank highest, collapsed-absence frames rank lowest.
+- Added unit tests for the low-confidence signal, confidence triage annotation, pipeline confidence plumbing, absence-run collapse, and review-score ranking.
+- Added **multi-point corrections / action-based interaction counting**: a point correction can carry several clicks (`x,y;x,y` in the UI/CLI, lists in manifests), the SAM2 runner applies all points with per-point labels, and `estimated_interactions` equals the real number of clicks (box = 1) so `actual_interactions` reflects true human effort instead of one-per-frame.
+- Added unit tests for multi-point correction construction and multi-point manifest parsing.
+- Added **click-to-correct** in the Gradio UI: clicking the source frame stages correction points (multi-click → multi-point), and two clicks in tight-box mode define a normalized box, filling the (still-editable) coordinate fields via `gr.Image.select` → `on_frame_click`. Pure helpers (`apply_point_click`, `apply_box_click`, `on_frame_click`) are unit-tested; the live Gradio wiring needs an interactive app run to confirm.
+
+### Verified
+
+- `python -m unittest discover -s tests` (38 tests).
+- First real-video CPU smoke (SAM2.1 hiera tiny) on `data/eval_videos/8589b8c5…mp4`: baseline review queue 20/80 frames; two tight-box corrections cut the queue to 10 and cleared all empty-mask frames (see `PLAN_TRACKER.md` P7 实验记录).
+- Ground-truth J&F evaluation across 5 DAVIS-2017 single-object sequences (mean J&F ~0.96, queue near-silent) and 15 MOSE crowded multi-object videos (mean J&F ~0.88; two natural drift+recovery samples — 23b9a3ea 0.79→0.92, 398d41f5 0.59→0.68 — via GT-derived box corrections). Results table written to `README.md` (实验结果).
+- GPU validation on an RTX 3060 (`torch 2.5.1+cu124`): ~0.35–0.5 s/frame (~12–16× over CPU); bedroom video re-run at full 388 frames (queue flags 72 frames across 4+ tracking-loss episodes).
+
 ## [0.1.0] - 2026-06-11
 
 ### Added

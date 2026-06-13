@@ -42,6 +42,23 @@ class CorrectionsTest(unittest.TestCase):
         self.assertEqual(correction["box_xyxy"], [1, 2, 30, 40])
         self.assertEqual(correction["note"], "edge drift")
 
+    def test_build_multi_point_correction_counts_each_click(self) -> None:
+        correction = build_correction(
+            frame_index=5,
+            correction_type="positive_point",
+            point_xy="10,20;30,40;50,60",
+        )
+        self.assertEqual(
+            correction["points"],
+            [
+                {"x": 10, "y": 20, "label": "positive"},
+                {"x": 30, "y": 40, "label": "positive"},
+                {"x": 50, "y": 60, "label": "positive"},
+            ],
+        )
+        # one human interaction per click — a hard frame may need several points
+        self.assertEqual(correction["estimated_interactions"], 3)
+
     def test_rejects_invalid_correction_inputs(self) -> None:
         with self.assertRaises(ValueError):
             build_correction(frame_index=0, correction_type="positive_point", point_xy="1")

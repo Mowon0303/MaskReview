@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import cv2
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -81,6 +82,16 @@ class EvaluationTest(unittest.TestCase):
             self.assertEqual(cases[0].video_path, root / "videos" / "a.mp4")
             self.assertEqual(cases[0].expected_review_frames, (2, 4, 5))
             self.assertEqual(cases[0].corrections[0]["points"][0]["label"], "negative")
+
+    def test_manifest_multi_point_correction_counts_clicks(self) -> None:
+        from evaluation import normalize_manifest_correction
+
+        correction = normalize_manifest_correction(
+            {"frame_index": 3, "type": "positive_point", "point_xy": [[10, 20], [30, 40]]}
+        )
+        self.assertEqual(len(correction["points"]), 2)
+        self.assertEqual(correction["estimated_interactions"], 2)
+        self.assertEqual(correction["points"][0], {"x": 10, "y": 20, "label": "positive"})
 
     def test_run_evaluation_writes_csv_report_and_after_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -159,6 +170,10 @@ class EvaluationTest(unittest.TestCase):
             self.assertEqual(summary.rows[0]["after_reason_counts"], "{}")
             self.assertTrue((root / "outputs" / "unit-eval" / "overlay_after.mp4").exists())
             self.assertTrue((root / "outputs" / "unit-eval" / "comparison.json").exists())
+            # ground-truth quality columns stay empty when no ground_truth_mask_dir is given
+            self.assertEqual(summary.rows[0]["gt_quality_labeled"], False)
+            self.assertEqual(summary.rows[0]["gt_jf_before"], "")
+            self.assertEqual(summary.rows[0]["gt_jf_after"], "")
 
             with summary.csv_path.open(encoding="utf-8", newline="") as file:
                 rows = list(csv.DictReader(file))
@@ -167,6 +182,70 @@ class EvaluationTest(unittest.TestCase):
             self.assertIn("MaskReview Evaluation Report", report)
             self.assertIn("Queue label precision/recall/F1: 1.0 / 1.0 / 1.0", report)
             self.assertIn("Queue Reason Counts", report)
+
+    def test_run_evaluation_scores_ground_truth_quality(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "sample.mp4").write_bytes(b"fake")
+            gt_dir = root / "gt"
+            gt_dir.mkdir()
+            gt_mask = np.zeros((4, 6), dtype=np.uint8)
+            gt_mask[1:3, 1:5] = 1  # inset square (not full-frame) for all frames
+            for idx in range(3):
+                cv2.imwrite(str(gt_dir / f"{idx:06d}.png"), (gt_mask * 255).astype(np.uint8))
+
+            manifest_path = root / "eval_manifest.json"
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "cases": [
+                            {
+                                "id": "gt-eval",
+                                "video_path": "sample.mp4",
+                                "object_name": "toy",
+                                "init_box_xyxy": [0, 0, 5, 3],
+                                "expected_challenge": "mask_drop",
+                                "ground_truth_mask_dir": "gt",
+                                "corrections": [
+                                    {"frame_index": 2, "type": "positive_point", "point_xy": [1, 2]}
+                                ],
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            def fake_extract(video_path_arg: Path, frame_dir: Path):
+                frame_dir.mkdir(parents=True, exist_ok=True)
+                return VideoMetadata(fps=5.0, width=6, height=4, frame_count=3)
+
+            def fake_render_overlay(**kwargs):
+                output_path = kwargs["output_path"]
+                output_path.write_bytes(b"mp4")
+                return output_path
+
+            # NOTE: save_mask is left un-patched so real PNG masks are scored against ground truth.
+            with patch.object(pipeline_module, "extract_video_frames", side_effect=fake_extract), patch.object(
+                pipeline_module, "render_overlay_video", side_effect=fake_render_overlay
+            ):
+                summary = run_evaluation(
+                    manifest_path=manifest_path,
+                    config=EvalConfig(output_dir=root / "outputs", fixed_interval=1),
+                    pipeline=PromptableVideoSegmentationPipeline(FakeEvalSegmenter()),
+                )
+
+            row = summary.rows[0]
+            self.assertEqual(row["gt_quality_labeled"], True)
+            self.assertEqual(row["gt_frames_scored"], 3)
+            self.assertIsInstance(row["gt_jf_before"], float)
+            self.assertIsInstance(row["gt_jf_after"], float)
+            self.assertGreaterEqual(row["gt_jf_before"], 0.0)
+            self.assertLessEqual(row["gt_jf_after"], 1.0)
+            # baseline frame 2 mask is empty vs a non-empty target; correcting it cannot hurt J&F.
+            self.assertGreaterEqual(row["gt_jf_after"], row["gt_jf_before"])
+            report = summary.report_path.read_text(encoding="utf-8")
+            self.assertIn("Ground-Truth Quality", report)
 
     def test_run_threshold_calibration_writes_policy_summary(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

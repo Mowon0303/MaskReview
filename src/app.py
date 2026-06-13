@@ -471,11 +471,13 @@ REASON_STYLES = {
     "mask_center_jumped": ("DCTR", "#ff7a45"),
     "mask_touches_frame_edge": ("EDGE", "#7aa2ff"),
     "mask_iou_dropped": ("IoU-", "#c08bff"),
+    "low_mask_confidence": ("CONF-", "#ff5ea8"),
 }
 
 REASON_RISK = {
     "empty_initial_mask": 0.95,
     "empty_mask": 0.92,
+    "low_mask_confidence": 0.88,
     "mask_center_jumped": 0.84,
     "mask_iou_dropped": 0.78,
     "mask_area_spiked": 0.72,
@@ -514,6 +516,11 @@ def reason_list(item: dict[str, Any]) -> list[str]:
 
 
 def infer_item_risk(item: dict[str, Any]) -> float:
+    # Prefer the pipeline's unified review_score (single source of truth); fall back to
+    # the local reason-weight heuristic for older artifacts without a score.
+    score = item.get("review_score")
+    if isinstance(score, (int, float)):
+        return float(score)
     reasons = reason_list(item)
     base = max((REASON_RISK.get(reason, 0.55) for reason in reasons), default=0.55)
     return min(0.98, base + max(0, len(reasons) - 1) * 0.04)
@@ -791,6 +798,36 @@ def save_selected_correction(
     return corrections, status
 
 
+def apply_point_click(point_text: str, x: int, y: int) -> str:
+    """Append a clicked (x, y) to the multi-point text ('x,y;x,y'); one click = one point."""
+    chunk = f"{int(x)},{int(y)}"
+    existing = (point_text or "").strip().strip(";")
+    return f"{existing};{chunk}" if existing else chunk
+
+
+def apply_box_click(box_text: str, x: int, y: int) -> str:
+    """Two-click box: first click sets a corner, the second completes a normalized box.
+
+    A click on an already-complete (4-value) or malformed box starts a fresh corner.
+    """
+    x, y = int(x), int(y)
+    values = [int(v.strip()) for v in (box_text or "").split(",") if v.strip()]
+    if len(values) == 2:  # one corner pending -> complete + normalize
+        x1, y1 = values
+        return f"{min(x1, x)},{min(y1, y)},{max(x1, x)},{max(y1, y)}"
+    return f"{x},{y}"
+
+
+def on_frame_click(correction_type: str, point_text: str, box_text: str, evt: "gr.SelectData"):
+    """Frame-click handler: stage a point (point modes) or a box corner (tight_box) into the textboxes."""
+    if evt is None or getattr(evt, "index", None) is None:
+        return point_text, box_text
+    x, y = int(evt.index[0]), int(evt.index[1])
+    if correction_type == "tight_box":
+        return point_text, apply_box_click(box_text, x, y)
+    return apply_point_click(point_text, x, y), box_text
+
+
 def build_correction_runner(pipeline: PromptableVideoSegmentationPipeline):
     def run_corrected_propagation(run_state: Optional[dict[str, Any]]):
         if not run_state or "run_dir" not in run_state:
@@ -944,7 +981,7 @@ def build_demo(args: argparse.Namespace):
                     with gr.Column(scale=4, min_width=348, elem_classes=["mr-right"]):
                         gr.HTML('<div class="mr-panel-title"><span>Selected queue item</span><span class="chip">JSON</span></div>')
                         selected_review_item = gr.JSON(label="Selected queue item")
-                        gr.HTML('<div class="mr-panel-title"><span>Correction</span><span class="chip">one point / box</span></div>')
+                        gr.HTML('<div class="mr-panel-title"><span>Correction</span><span class="chip">click frame · point/box</span></div>')
                         correction_type = gr.Radio(
                             choices=[
                                 ("Positive point", "positive_point"),
@@ -954,7 +991,11 @@ def build_demo(args: argparse.Namespace):
                             value="positive_point",
                             label="Correction type",
                         )
-                        point_xy = gr.Textbox(label="Point · x,y px", placeholder="120,180")
+                        gr.HTML('<div class="mr-viewer-note">Click the source frame above to add point(s); for a tight box click two opposite corners. Clicks fill the fields below (still editable).</div>')
+                        point_xy = gr.Textbox(
+                            label="Point(s) · x,y px (use ; for several clicks)",
+                            placeholder="120,180  or  120,180;200,90",
+                        )
                         correction_box = gr.Textbox(
                             label="Tight box · x1,y1,x2,y2",
                             placeholder="80,120,260,420",
@@ -1008,6 +1049,11 @@ def build_demo(args: argparse.Namespace):
             load_review_frame,
             inputs=[review_frame, run_state],
             outputs=[review_frame_image, review_mask_image, selected_review_item],
+        )
+        review_frame_image.select(
+            on_frame_click,
+            inputs=[correction_type, point_xy, correction_box],
+            outputs=[point_xy, correction_box],
         )
         save_button.click(
             save_selected_correction,

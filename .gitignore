@@ -16,4 +16,7 @@ data/eval_videos/*
 !data/eval_videos/.gitkeep
 data/eval_first_frames/*
 !data/eval_first_frames/.gitkeep
+data/davis/
+data/mose/
+.cache/
 

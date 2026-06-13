@@ -27,11 +27,11 @@ Estimated readiness by target:
 1. Queue quality is still heuristic.
    The current detector uses empty masks, area jumps, center jumps, frame-edge contact, mask IoU drops, and area trends. It can still miss semantic drift where geometry stays plausible but the mask moves to the wrong object.
 
-2. Correction UX is not yet practical.
-   The UI captures coordinates as text. A real user should click directly on the frame or draw a box, with immediate visual feedback.
+2. Correction UX — click-to-correct added (pending live verification).
+   Clicking the source frame now stages correction points (multi-click → multi-point) and two clicks define a tight box, via `gr.Image.select` → `on_frame_click`; the coordinate fields stay editable. The pure click→coordinate logic is unit-tested, but the live Gradio wiring (and click-coordinate scaling on a resized image) still needs an interactive app run to confirm. Remaining polish: a visible crosshair/box overlay for immediate feedback (the design prototype's correction canvas).
 
-3. Evaluation lacks ground truth quality metrics.
-   The harness measures interactions and queue counts, but not IoU, J&F, or correction recovery quality against labeled masks.
+3. Evaluation ground-truth quality scoring exists but lacks labeled data.
+   The harness can now score region IoU (J), boundary F, and J&F before/after corrections when a case provides `ground_truth_mask_dir` (`src/quality_metrics.py`). What is still missing is the labeled ground-truth masks themselves on real videos, so recovery quality is not yet measured on real data.
 
 4. Recovery policy is still basic.
    Saved corrections are applied and re-propagated, but there is no strategy for multiple correction order, conflict handling, local-only correction windows, or rollback.

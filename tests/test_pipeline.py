@@ -48,6 +48,13 @@ class FakeCorrectionSegmenter(FakeSegmenter):
         }
 
 
+class FakeConfidenceSegmenter(FakeSegmenter):
+    """Like FakeSegmenter but also exposes per-frame SAM2 confidence (frame 2 is low)."""
+
+    def __init__(self) -> None:
+        self.last_confidences = {0: 0.95, 1: 0.9, 2: 0.1}
+
+
 class PipelineTest(unittest.TestCase):
     def test_detect_review_frames_flags_area_jumps(self) -> None:
         self.assertEqual(detect_review_frames([100, 105, 20], jump_ratio=0.6), [2])
@@ -97,6 +104,68 @@ class PipelineTest(unittest.TestCase):
         decline_queue = build_review_queue([100, 80, 60], area_decline_ratio=0.35)
         self.assertEqual(decline_queue[0]["frame_index"], 2)
         self.assertEqual(decline_queue[0]["reason"], "mask_area_trending_down")
+
+    def test_build_review_queue_flags_low_sam2_confidence(self) -> None:
+        # geometrically stable areas, but frame 2 has low SAM2 confidence
+        queue = build_review_queue(
+            [100, 100, 100, 100],
+            confidences={0: 0.99, 1: 0.98, 2: 0.2, 3: 0.97},
+            low_confidence_threshold=0.5,
+        )
+        self.assertEqual([item["frame_index"] for item in queue], [2])
+        self.assertEqual(queue[0]["reason"], "low_mask_confidence")
+        self.assertEqual(queue[0]["diagnostics"]["confidence"], 0.2)
+        # without confidences the behaviour is unchanged (geometric only)
+        self.assertEqual(build_review_queue([100, 100, 100, 100]), [])
+
+    def test_review_queue_annotates_confidence_for_triage(self) -> None:
+        # geometric drop flags frame 2; its (high) confidence is attached for triage
+        queue = build_review_queue(
+            [100, 100, 20],
+            jump_ratio=0.6,
+            confidences={0: 0.99, 1: 0.98, 2: 0.95},
+            low_confidence_threshold=0.5,
+        )
+        item = next(it for it in queue if it["frame_index"] == 2)
+        self.assertIn("mask_area_dropped", item["reasons"])
+        self.assertNotIn("low_mask_confidence", item["reasons"])  # high conf -> not a confidence flag
+        self.assertEqual(item["diagnostics"]["confidence"], 0.95)
+
+    def test_collapse_low_confidence_empty_runs(self) -> None:
+        # frames 2,3,4 are empty + low SAM2 confidence -> a likely object-absence run.
+        areas = [100, 100, 0, 0, 0]
+        conf = {0: 0.99, 1: 0.98, 2: 0.05, 3: 0.04, 4: 0.06}
+        queue = build_review_queue(areas, confidences=conf, low_confidence_threshold=0.5)
+        by_frame = {it["frame_index"]: it for it in queue}
+        self.assertEqual(sorted(by_frame), [2, 3, 4])
+        # collapsed to one onset interaction instead of one per frame
+        self.assertEqual(by_frame[2]["estimated_interactions"], 1)
+        self.assertEqual(by_frame[3]["estimated_interactions"], 0)
+        self.assertEqual(by_frame[4]["estimated_interactions"], 0)
+        self.assertEqual(by_frame[3]["status"], "low_confidence_empty")
+        self.assertEqual(sum(int(it["estimated_interactions"]) for it in queue), 1)
+        # disabling collapse restores one interaction per flagged frame
+        queue_raw = build_review_queue(
+            areas, confidences=conf, low_confidence_threshold=0.5, collapse_low_confidence_runs=False
+        )
+        self.assertEqual(sum(int(it["estimated_interactions"]) for it in queue_raw), 3)
+
+    def test_review_score_ranks_and_suppresses(self) -> None:
+        # a benign scale-trend flag ranks lower than an identity-change flag
+        trend = build_review_queue([100, 80, 60], area_decline_ratio=0.35)[0]
+        self.assertLess(trend["review_score"], 0.7)
+        first = np.zeros((10, 10), dtype=np.uint8)
+        second = np.zeros((10, 10), dtype=np.uint8)
+        first[2:4, 1:3] = 1
+        second[2:4, 7:9] = 1
+        jump = build_review_queue([int(first.sum()), int(second.sum())], masks={0: first, 1: second})[0]
+        self.assertGreater(jump["review_score"], trend["review_score"])  # center/IoU jump > scale trend
+        # collapsed absence frames are ranked low; the onset keeps real priority
+        areas = [100, 100, 0, 0, 0]
+        conf = {0: 0.99, 1: 0.98, 2: 0.05, 3: 0.04, 4: 0.06}
+        by_frame = {it["frame_index"]: it for it in build_review_queue(areas, confidences=conf)}
+        self.assertEqual(by_frame[3]["review_score"], 0.15)
+        self.assertGreater(by_frame[2]["review_score"], 0.5)
 
     def test_compute_mask_iou(self) -> None:
         first = np.zeros((4, 4), dtype=np.uint8)
@@ -162,6 +231,42 @@ class PipelineTest(unittest.TestCase):
 
             review_queue = json.loads(result.review_queue_path.read_text(encoding="utf-8"))
             self.assertEqual(review_queue[0]["mask_path"], str(result.mask_dir / "000002.png"))
+
+    def test_pipeline_records_sam2_confidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            video_path = root / "sample.mp4"
+            video_path.write_bytes(b"fake")
+
+            def fake_extract(video_path_arg: Path, frame_dir: Path):
+                frame_dir.mkdir(parents=True, exist_ok=True)
+                return VideoMetadata(fps=5.0, width=6, height=4, frame_count=3)
+
+            def fake_save_mask(mask: np.ndarray, output_path: Path) -> None:
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                output_path.write_bytes((mask * 255).astype(np.uint8).tobytes())
+
+            def fake_render_overlay(**kwargs):
+                kwargs["output_path"].write_bytes(b"mp4")
+                return kwargs["output_path"]
+
+            with patch.object(pipeline, "extract_video_frames", side_effect=fake_extract), patch.object(
+                pipeline, "save_mask", side_effect=fake_save_mask
+            ), patch.object(pipeline, "render_overlay_video", side_effect=fake_render_overlay):
+                result = PromptableVideoSegmentationPipeline(FakeConfidenceSegmenter()).run(
+                    VideoSegmentationRequest(
+                        video_path=video_path,
+                        init_box_xyxy=(0, 0, 5, 3),
+                        output_dir=root / "outputs",
+                        run_id="conf-test",
+                    )
+                )
+
+            metrics = json.loads(result.metrics_path.read_text(encoding="utf-8"))
+            self.assertEqual(metrics["mask_confidences"], [0.95, 0.9, 0.1])
+            item2 = next(it for it in metrics["review_queue"] if it["frame_index"] == 2)
+            self.assertIn("low_mask_confidence", item2["reasons"])
+            self.assertEqual(item2["diagnostics"]["confidence"], 0.1)
 
     def test_pipeline_writes_after_artifacts_with_corrections(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

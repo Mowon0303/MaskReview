@@ -14,6 +14,7 @@ from pipeline import (
     ReviewPolicy,
     VideoSegmentationRequest,
 )
+from quality_metrics import resolve_ground_truth_dir, score_mask_dirs
 
 
 @dataclass(frozen=True)
@@ -26,6 +27,7 @@ class EvalCase:
     notes: str = ""
     expected_review_frames: Optional[tuple[int, ...]] = None
     corrections: tuple[dict[str, Any], ...] = ()
+    ground_truth_mask_dir: Optional[Path] = None
 
 
 @dataclass(frozen=True)
@@ -94,6 +96,12 @@ def parse_eval_case(raw_case: dict[str, Any], base_dir: Path) -> EvalCase:
         normalize_manifest_correction(correction)
         for correction in raw_case.get("corrections", [])
     )
+    ground_truth_mask_dir = resolve_ground_truth_dir(
+        raw_case.get("ground_truth_mask_dir")
+        or raw_case.get("gt_mask_dir")
+        or raw_case.get("ground_truth_dir"),
+        base_dir,
+    )
     return EvalCase(
         case_id=sanitize_case_id(case_id),
         video_path=video_path,
@@ -103,6 +111,7 @@ def parse_eval_case(raw_case: dict[str, Any], base_dir: Path) -> EvalCase:
         notes=str(raw_case.get("notes", "")),
         expected_review_frames=expected_review_frames,
         corrections=corrections,
+        ground_truth_mask_dir=ground_truth_mask_dir,
     )
 
 
@@ -201,9 +210,39 @@ def evaluate_case(
         "after_overlay_path": "",
         "after_metrics_path": "",
         "comparison_path": "",
+        "gt_quality_labeled": case.ground_truth_mask_dir is not None,
+        "gt_frames_scored": "",
+        "gt_mean_iou_before": "",
+        "gt_boundary_f_before": "",
+        "gt_jf_before": "",
+        "gt_mean_iou_after": "",
+        "gt_boundary_f_after": "",
+        "gt_jf_after": "",
+        "gt_jf_delta": "",
     }
     row.update(queue_label_metrics)
     row.update(fixed_label_metrics)
+
+    mask_height = int(metrics_before.get("height", 0))
+    mask_width = int(metrics_before.get("width", 0))
+    quality_before: Optional[dict[str, Any]] = None
+    if case.ground_truth_mask_dir is not None:
+        quality_before = score_mask_dirs(
+            pred_mask_dir=result.mask_dir,
+            gt_mask_dir=case.ground_truth_mask_dir,
+            frame_count=result.frame_count,
+            height=mask_height,
+            width=mask_width,
+        )
+        if quality_before["frames_scored"]:
+            row.update(
+                {
+                    "gt_frames_scored": quality_before["frames_scored"],
+                    "gt_mean_iou_before": quality_before["mean_iou"],
+                    "gt_boundary_f_before": quality_before["mean_boundary_f"],
+                    "gt_jf_before": quality_before["jf"],
+                }
+            )
 
     if case.corrections:
         for correction in case.corrections:
@@ -238,6 +277,24 @@ def evaluate_case(
                 "comparison_path": str(corrected.comparison_path),
             }
         )
+
+        if quality_before is not None and quality_before["frames_scored"]:
+            quality_after = score_mask_dirs(
+                pred_mask_dir=corrected.mask_dir,
+                gt_mask_dir=case.ground_truth_mask_dir,
+                frame_count=corrected.frame_count,
+                height=mask_height,
+                width=mask_width,
+            )
+            if quality_after["frames_scored"]:
+                row.update(
+                    {
+                        "gt_mean_iou_after": quality_after["mean_iou"],
+                        "gt_boundary_f_after": quality_after["mean_boundary_f"],
+                        "gt_jf_after": quality_after["jf"],
+                        "gt_jf_delta": round(quality_after["jf"] - quality_before["jf"], 4),
+                    }
+                )
 
     return row
 
@@ -333,6 +390,46 @@ def write_report(
         after_reasons = row.get("after_reason_counts") or "n/a"
         lines.append(f"| {row['case_id']} | `{row['queue_reason_counts']}` | `{after_reasons}` |")
 
+    quality_rows = [
+        row for row in rows
+        if row.get("gt_quality_labeled") is True and row.get("gt_jf_before") not in ("", None)
+    ]
+    if quality_rows:
+        lines.extend(
+            [
+                "",
+                "## Ground-Truth Quality (J = region IoU, F = boundary F, J&F = mean)",
+                "",
+                "| Case | Frames | J&F before | J&F after | delta J&F | J before | F before |",
+                "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+            ]
+        )
+        for row in quality_rows:
+            jf_after = row["gt_jf_after"] if row["gt_jf_after"] not in ("", None) else "n/a"
+            jf_delta = row["gt_jf_delta"] if row["gt_jf_delta"] not in ("", None) else "n/a"
+            lines.append(
+                "| {case} | {frames} | {jf_before} | {jf_after} | {delta} | {iou} | {boundary} |".format(
+                    case=row["case_id"],
+                    frames=row["gt_frames_scored"],
+                    jf_before=row["gt_jf_before"],
+                    jf_after=jf_after,
+                    delta=jf_delta,
+                    iou=row["gt_mean_iou_before"],
+                    boundary=row["gt_boundary_f_before"],
+                )
+            )
+        before_vals = [float(row["gt_jf_before"]) for row in quality_rows if row["gt_jf_before"] not in ("", None)]
+        after_vals = [float(row["gt_jf_after"]) for row in quality_rows if row["gt_jf_after"] not in ("", None)]
+        lines.append("")
+        if before_vals:
+            lines.append(
+                f"- Mean J&F before corrections: {round(sum(before_vals) / len(before_vals), 4)} over {len(before_vals)} case(s)"
+            )
+        if after_vals:
+            lines.append(
+                f"- Mean J&F after corrections: {round(sum(after_vals) / len(after_vals), 4)} over {len(after_vals)} case(s)"
+            )
+
     lines.extend(
         [
             "",
@@ -343,6 +440,7 @@ def write_report(
             "- When `expected_review_frames` is labeled, prioritize recall before reducing false positives.",
             "- After-correction runs should reduce the queue or restore mask stability when the target remains visible.",
             "- Cases without corrections only validate detection and cost estimates, not recovery.",
+            "- With `ground_truth_mask_dir`, J&F before/after measures whether corrections actually recover mask quality.",
             "",
         ]
     )
@@ -428,6 +526,13 @@ def summarize_calibration_policy(
     )
     label_summary = summarize_label_metrics(eval_rows)
 
+    gt_rows = [
+        row for row in eval_rows
+        if row.get("gt_quality_labeled") is True and row.get("gt_jf_before") not in ("", None)
+    ]
+    gt_before = [float(row["gt_jf_before"]) for row in gt_rows]
+    gt_after = [float(row["gt_jf_after"]) for row in gt_rows if row.get("gt_jf_after") not in ("", None)]
+
     return {
         "policy_name": policy_name,
         "review_policy_config": json.dumps(review_policy.to_dict(), sort_keys=True),
@@ -451,6 +556,9 @@ def summarize_calibration_policy(
         "fixed_interval_precision": label_summary["fixed_interval_precision"],
         "fixed_interval_recall": label_summary["fixed_interval_recall"],
         "fixed_interval_f1": label_summary["fixed_interval_f1"],
+        "gt_quality_cases": len(gt_rows),
+        "mean_jf_before": round(sum(gt_before) / len(gt_before), 4) if gt_before else "",
+        "mean_jf_after": round(sum(gt_after) / len(gt_after), 4) if gt_after else "",
         "eval_report_path": str(eval_report_path),
     }
 
@@ -466,12 +574,15 @@ def write_threshold_calibration_report(
         f"- Manifest: `{manifest_path}`",
         f"- Policies evaluated: {len(rows)}",
         "",
-        "| Policy | Queue frames | Fixed frames | Saved | Labeled cases | Queue P/R/F1 | Fixed P/R/F1 | Config |",
-        "| --- | ---: | ---: | ---: | ---: | --- | --- | --- |",
+        "| Policy | Queue frames | Fixed frames | Saved | Labeled cases | Queue P/R/F1 | Fixed P/R/F1 | Mean J&F b/a | Config |",
+        "| --- | ---: | ---: | ---: | ---: | --- | --- | --- | --- |",
     ]
     for row in rows:
+        jf_before = row.get("mean_jf_before", "")
+        jf_after = row.get("mean_jf_after", "")
+        jf_cell = "n/a" if jf_before in ("", None) else f"{jf_before}/{jf_after if jf_after not in ('', None) else 'n/a'}"
         lines.append(
-            "| {policy} | {queue} | {fixed} | {saved} | {labeled} | {queue_prf} | {fixed_prf} | `{config}` |".format(
+            "| {policy} | {queue} | {fixed} | {saved} | {labeled} | {queue_prf} | {fixed_prf} | {jf} | `{config}` |".format(
                 policy=row["policy_name"],
                 queue=row["total_queue_frames"],
                 fixed=row["total_fixed_interval_frames"],
@@ -479,6 +590,7 @@ def write_threshold_calibration_report(
                 labeled=row["labeled_cases"],
                 queue_prf=format_prf(row, "queue"),
                 fixed_prf=format_prf(row, "fixed_interval"),
+                jf=jf_cell,
                 config=row["review_policy_config"],
             )
         )
@@ -492,7 +604,7 @@ def write_threshold_calibration_report(
             "- Prefer `sensitive` when missing drift is more costly than reviewing extra frames.",
             "- Prefer `conservative` only when review volume is too high and drift misses are acceptable.",
             "- With `expected_review_frames` labels, choose the least expensive policy that keeps recall high.",
-            "- Full mask IoU/J&F is still pending for final quality scoring.",
+            "- With `ground_truth_mask_dir`, compare Mean J&F before/after to confirm corrections recover quality, not just shrink the queue.",
             "",
         ]
     )
@@ -504,20 +616,28 @@ def normalize_manifest_correction(raw_correction: dict[str, Any]) -> dict[str, A
     correction = dict(raw_correction)
     correction_type = str(correction.get("type", ""))
     correction["frame_index"] = int(correction["frame_index"])
-    correction.setdefault("estimated_interactions", 1)
 
     if correction_type in {"positive_point", "negative_point"}:
-        if "points" not in correction:
-            point = correction.get("point_xy")
-            if point is None:
+        label = "positive" if correction_type == "positive_point" else "negative"
+        if "points" in correction:
+            correction["points"] = [
+                {"x": int(p["x"]), "y": int(p["y"]), "label": p.get("label", label)}
+                for p in correction["points"]
+            ]
+        else:
+            raw_points = correction.get("point_xy")
+            if raw_points is None:
                 raise ValueError(f"Point correction missing points or point_xy: {raw_correction}")
-            x, y = parse_manifest_point(point)
-            label = "positive" if correction_type == "positive_point" else "negative"
-            correction["points"] = [{"x": x, "y": y, "label": label}]
+            correction["points"] = [
+                {"x": x, "y": y, "label": label} for x, y in parse_manifest_points(raw_points)
+            ]
+        # one interaction per click unless the manifest states a count explicitly
+        correction.setdefault("estimated_interactions", len(correction["points"]))
         return correction
 
     if correction_type == "tight_box":
         correction["box_xyxy"] = list(parse_manifest_box(correction.get("box_xyxy"), "box_xyxy"))
+        correction.setdefault("estimated_interactions", 1)
         return correction
 
     raise ValueError(f"Unsupported correction type in eval manifest: {correction_type}")
@@ -531,6 +651,24 @@ def parse_manifest_point(raw_point: Any) -> tuple[int, int]:
     if len(values) != 2:
         raise ValueError("point_xy must contain exactly two values.")
     return values[0], values[1]
+
+
+def parse_manifest_points(raw_points: Any) -> list[tuple[int, int]]:
+    """Parse one or more points from a manifest: 'x,y' | 'x,y;x,y' | [x,y] | [[x,y],...] | [{x,y},...]."""
+    if isinstance(raw_points, str):
+        return [parse_manifest_point(chunk) for chunk in raw_points.split(";") if chunk.strip()]
+    if isinstance(raw_points, dict):
+        return [(int(raw_points["x"]), int(raw_points["y"]))]
+    sequence = list(raw_points)
+    if sequence and not isinstance(sequence[0], (list, tuple, dict)):
+        return [parse_manifest_point(sequence)]  # a flat [x, y]
+    points: list[tuple[int, int]] = []
+    for point in sequence:
+        if isinstance(point, dict):
+            points.append((int(point["x"]), int(point["y"])))
+        else:
+            points.append(parse_manifest_point(point))
+    return points
 
 
 def parse_optional_frame_indices(
