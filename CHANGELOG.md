@@ -6,7 +6,8 @@ All notable changes to this project are documented here.
 
 ### Added
 
-- Added `docs/cvat_plugin.md`: P8 design doc for the CVAT plugin (self-hosted Docker CVAT, cvat-sdk path, offline export layer + thin client, masks→COCO RLE, review_queue→CVAT issues, frame alignment). Code not yet implemented.
+- Added `docs/cvat_plugin.md`: P8 design doc for the CVAT plugin (self-hosted Docker CVAT, cvat-sdk path, offline export layer + thin client, masks→COCO RLE, review_queue→CVAT issues, frame alignment).
+- Added `src/cvat/export.py` (P8 step 1, offline + unit-tested, no cvat-sdk): `masks_to_coco` (COCO RLE), `mask_to_cvat_points` (CVAT mask-shape RLE), `queue_to_issues` (review_queue→CVAT issue payloads, `min_score` drops damped/collapsed frames), and `interaction_report`. Live cvat-sdk client still pending.
 
 - Added `src/quality_metrics.py` with region IoU (J), boundary F-measure (F), and J&F mask-quality scoring against ground-truth masks.
 - Added optional `ground_truth_mask_dir` per eval manifest case; the harness now scores propagation quality (J/F/J&F) before and after corrections.
